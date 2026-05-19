@@ -1,0 +1,8 @@
+__pycache__/
+*.py[cod]
+config.json
+logs/
+venv/
+bulk-output/
+bulk-*/
+*-output/
