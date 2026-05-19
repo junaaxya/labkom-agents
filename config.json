@@ -1,0 +1,7 @@
+{
+  "pc_code": "PC-LAB1-01",
+  "agent_token": "a0bf73d76b6c1ca6befbfec70bf70c05070cfcdfa741aa41916f628511a2dca0",
+  "base_url": "http://localhost:5000/api/v1/pcs",
+  "heartbeat_interval": 60,
+  "command_poll_interval": 30
+}

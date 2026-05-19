@@ -1,0 +1,7 @@
+{
+  "pc_code": "PC-LAB1-01",
+  "agent_token": "YOUR_TOKEN_FROM_GENERATE_ENDPOINT",
+  "base_url": "http://YOUR_SERVER:5000/api/v1/pcs",
+  "heartbeat_interval": 60,
+  "command_poll_interval": 30
+}

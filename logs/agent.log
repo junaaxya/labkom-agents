@@ -1,0 +1,47 @@
+2026-05-07 17:44:37,577 [INFO] LabKom Agent starting for PC: PC-LAB1-01
+2026-05-07 17:44:37,610 [INFO] Registered successfully
+2026-05-07 17:44:38,664 [INFO] Executing RESTART
+2026-05-07 17:44:38,694 [INFO] Executing SHUTDOWN
+2026-05-07 17:44:38,723 [INFO] Executing SLEEP
+2026-05-07 17:44:38,754 [INFO] Executing LOCK
+2026-05-07 17:44:38,786 [INFO] Displaying MESSAGE: Pesan dari admin
+2026-05-07 17:44:38,815 [INFO] Executing SHUTDOWN
+2026-05-07 17:44:38,851 [INFO] Executing SHUTDOWN
+2026-05-07 17:44:39,180 [INFO] Displaying MESSAGE: Pesan dari admin
+2026-05-07 17:44:39,226 [ERROR] Failed to report result for cmoso0wcf000gofcron5cp5eg: HTTPConnectionPool(host='localhost', port=5000): Max retries exceeded with url: /api/v1/pcs/agent/commands/cmoso0wcf000gofcron5cp5eg/result (Caused by NewConnectionError("HTTPConnection(host='localhost', port=5000): Failed to establish a new connection: [Errno 111] Connection refused"))
+2026-05-07 17:44:39,236 [INFO] Executing SLEEP
+2026-05-07 17:44:39,242 [ERROR] Failed to report result for cmosp0skg000iofcrqphxyzxq: HTTPConnectionPool(host='localhost', port=5000): Max retries exceeded with url: /api/v1/pcs/agent/commands/cmosp0skg000iofcrqphxyzxq/result (Caused by NewConnectionError("HTTPConnection(host='localhost', port=5000): Failed to establish a new connection: [Errno 111] Connection refused"))
+2026-05-07 17:44:39,246 [INFO] Displaying MESSAGE: Pesan dari admin
+2026-05-07 17:44:39,257 [ERROR] Failed to report result for cmospusug0001of11vgkl70n8: HTTPConnectionPool(host='localhost', port=5000): Max retries exceeded with url: /api/v1/pcs/agent/commands/cmospusug0001of11vgkl70n8/result (Caused by NewConnectionError("HTTPConnection(host='localhost', port=5000): Failed to establish a new connection: [Errno 111] Connection refused"))
+2026-05-07 17:44:39,265 [INFO] Executing SHUTDOWN
+2026-05-07 17:44:39,279 [ERROR] Failed to report result for cmou4svs70005of4v4uhgyd1c: HTTPConnectionPool(host='localhost', port=5000): Max retries exceeded with url: /api/v1/pcs/agent/commands/cmou4svs70005of4v4uhgyd1c/result (Caused by NewConnectionError("HTTPConnection(host='localhost', port=5000): Failed to establish a new connection: [Errno 111] Connection refused"))
+2026-05-07 17:49:59,077 [INFO] LabKom Agent starting for PC: PC-LAB1-01
+2026-05-07 17:49:59,086 [ERROR] Register request failed: HTTPConnectionPool(host='localhost', port=5000): Max retries exceeded with url: /api/v1/pcs/agent/register (Caused by NewConnectionError("HTTPConnection(host='localhost', port=5000): Failed to establish a new connection: [Errno 111] Connection refused"))
+2026-05-07 17:49:59,086 [WARNING] Registration failed, will retry on next heartbeat
+2026-05-07 17:50:00,093 [WARNING] Heartbeat request failed: HTTPConnectionPool(host='localhost', port=5000): Max retries exceeded with url: /api/v1/pcs/agent/heartbeat (Caused by NewConnectionError("HTTPConnection(host='localhost', port=5000): Failed to establish a new connection: [Errno 111] Connection refused"))
+2026-05-07 17:51:35,788 [INFO] LabKom Agent starting for PC: PC-LAB1-01
+2026-05-07 17:51:35,845 [INFO] Registered successfully
+2026-05-07 17:52:47,270 [INFO] LabKom Agent starting for PC: PC-LAB1-01
+2026-05-07 17:52:47,341 [INFO] Registered successfully
+2026-05-07 20:47:54,533 [INFO] LabKom Agent starting for PC: PC-LAB1-01
+2026-05-07 20:47:54,586 [INFO] Registered successfully
+2026-05-07 20:47:55,653 [INFO] Executing SLEEP
+2026-05-07 20:51:32,160 [INFO] Executing SLEEP
+2026-05-07 20:51:32,209 [INFO] Executing SLEEP
+2026-05-07 20:53:06,468 [WARNING] Heartbeat failed: 401
+2026-05-07 20:54:07,499 [WARNING] Heartbeat failed: 401
+2026-05-07 21:07:33,118 [INFO] LabKom Agent starting for PC: PC-LAB1-01
+2026-05-07 21:07:33,240 [ERROR] Register failed: 401 {"success":false,"message":"Agent token tidak valid."}
+2026-05-07 21:07:33,241 [WARNING] Registration failed, will retry on next heartbeat
+2026-05-07 21:07:34,262 [WARNING] Heartbeat failed: 401
+2026-05-07 21:08:35,822 [INFO] LabKom Agent starting for PC: PC-LAB1-01
+2026-05-07 21:08:35,861 [INFO] Registered successfully
+2026-05-07 21:08:36,921 [INFO] Displaying MESSAGE: halo
+2026-05-07 21:08:36,948 [INFO] Displaying MESSAGE: haloo
+2026-05-07 21:14:43,978 [INFO] Displaying MESSAGE: halo
+2026-05-07 21:19:21,287 [INFO] LabKom Agent starting for PC: PC-LAB1-01
+2026-05-07 21:19:21,335 [INFO] Registered successfully
+2026-05-07 21:40:58,717 [INFO] LabKom Agent starting for PC: PC-LAB1-01
+2026-05-07 21:40:58,773 [INFO] Registered successfully
+2026-05-07 21:43:28,794 [INFO] LabKom Agent starting for PC: PC-LAB1-01
+2026-05-07 21:43:28,836 [INFO] Registered successfully
