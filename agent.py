@@ -5,12 +5,14 @@ import json
 import logging
 import os
 import platform
+import re
 import secrets
 import shutil
 import subprocess
 import sys
 import time
 from pathlib import Path
+from typing import Optional
 
 import psutil
 import requests
@@ -219,14 +221,40 @@ def execute_command(cmd: dict) -> tuple[bool, str]:
 
 
 def lock_windows_workstation() -> str:
-    subprocess.run(["rundll32.exe", "user32.dll,LockWorkStation"], check=False)
-
     tsdiscon = shutil.which("tsdiscon")
     if tsdiscon:
-        subprocess.run([tsdiscon], check=False)
-        return "Lock command sent with LockWorkStation and tsdiscon"
+        session_id = get_active_windows_session_id()
+        if session_id:
+            result = subprocess.run([tsdiscon, session_id], check=False)
+            if result.returncode == 0:
+                return f"Active Windows session {session_id} disconnected/locked with tsdiscon"
 
-    return "Lock command sent with LockWorkStation"
+        result = subprocess.run([tsdiscon], check=False)
+        if result.returncode == 0:
+            return "Active Windows session disconnected/locked with tsdiscon"
+
+    subprocess.run(["rundll32.exe", "user32.dll,LockWorkStation"], check=False)
+    return "LockWorkStation command sent; if agent runs as SYSTEM, Windows Session 0 isolation may prevent visible lock"
+
+
+def get_active_windows_session_id() -> Optional[str]:
+    for command in (["query", "user"], ["query", "session"]):
+        try:
+            result = subprocess.run(command, capture_output=True, text=True, check=False)
+        except OSError:
+            continue
+
+        if result.returncode != 0:
+            continue
+
+        for line in result.stdout.splitlines():
+            if "Active" not in line:
+                continue
+            match = re.search(r"\s+(\d+)\s+Active\b", line)
+            if match:
+                return match.group(1)
+
+    return None
 
 
 def report_result(config: dict, command_id: str, success: bool, result: str):
