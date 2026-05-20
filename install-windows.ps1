@@ -15,7 +15,10 @@
 
 param(
     [string]$BaseUrl = "http://lab-ilkom.my.id",
-    [string]$InstallDir = "C:\labkom-agent"
+    [string]$InstallDir = "C:\labkom-agent",
+    [string]$PythonVersion = "3.12.6",
+    [string]$PythonInstallerUrl = "",
+    [switch]$SkipPythonInstall
 )
 
 $ErrorActionPreference = "Stop"
@@ -245,14 +248,63 @@ Write-Ok ("Files copied to " + $InstallDir)
 
 # --- 7. Install Python deps ---
 Write-Step "Install Python dependencies"
-$python = "python"
-try {
-    & $python --version | Out-Null
-} catch {
-    Write-Err "Python not found in PATH. Install Python 3 first and tick 'Add Python to PATH'."
-    exit 1
+
+# 7a. Ensure Python is available. Skip if already installed (any 3.x), otherwise download and install silently.
+function Test-PythonAvailable {
+    try {
+        $cmd = Get-Command python -ErrorAction Stop
+        $verLine = & $cmd.Source --version 2>&1
+        if ($verLine -match "Python\s+3\.") {
+            return $cmd.Source
+        }
+        return $null
+    } catch {
+        return $null
+    }
 }
 
+$pythonPath = Test-PythonAvailable
+if (-not $pythonPath -and -not $SkipPythonInstall) {
+    Write-Info "Python 3 not found. Will download and install $PythonVersion silently."
+    if (-not $PythonInstallerUrl) {
+        $PythonInstallerUrl = "https://www.python.org/ftp/python/$PythonVersion/python-$PythonVersion-amd64.exe"
+    }
+    $pyInstaller = Join-Path $env:TEMP ("python-" + $PythonVersion + "-amd64.exe")
+    try {
+        Invoke-WebRequest -Uri $PythonInstallerUrl -OutFile $pyInstaller -UseBasicParsing
+    } catch {
+        Write-Err ("Failed to download Python installer: " + $_.Exception.Message)
+        exit 1
+    }
+
+    # InstallAllUsers + PrependPath so Get-Command python works for SYSTEM scheduled task too.
+    $pyArgs = @(
+        "/quiet",
+        "InstallAllUsers=1",
+        "PrependPath=1",
+        "Include_pip=1",
+        "Include_test=0",
+        "Include_launcher=1"
+    )
+    $proc = Start-Process -FilePath $pyInstaller -ArgumentList $pyArgs -Wait -PassThru
+    if ($proc.ExitCode -ne 0) {
+        Write-Err ("Python installer exited with code " + $proc.ExitCode)
+        exit 1
+    }
+    Remove-Item $pyInstaller -ErrorAction SilentlyContinue
+
+    # PATH for child processes only refreshes after env update; rebuild for this session.
+    $env:Path = [System.Environment]::GetEnvironmentVariable("Path", "Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path", "User")
+    $pythonPath = Test-PythonAvailable
+}
+
+if (-not $pythonPath) {
+    Write-Err "Python 3 still not available after install. Aborting."
+    exit 1
+}
+Write-Ok ("Python: " + $pythonPath)
+
+$python = $pythonPath
 Push-Location $InstallDir
 & $python -m pip install --upgrade pip | Out-Null
 & $python -m pip install -r requirements.txt
@@ -274,13 +326,16 @@ $config = @{
     command_poll_interval = 30
 }
 $configPath = Join-Path $InstallDir "config.json"
-$config | ConvertTo-Json -Depth 5 | Set-Content -Path $configPath -Encoding UTF8
+$configJson = $config | ConvertTo-Json -Depth 5
+# Write BOM-less UTF-8 so Python json.load can parse it on Windows PowerShell 5.1
+$utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+[System.IO.File]::WriteAllText($configPath, $configJson, $utf8NoBom)
 Write-Ok ("config.json written: " + $configPath)
 
 # --- 9. Register Task Scheduler as SYSTEM ---
 Write-Step "Register scheduled task LabKom Agent"
 $taskName = "LabKom Agent"
-$pythonPath = (Get-Command python).Path
+$pythonPath = $python
 $cmdArgs = ('/c cd /d "{0}" && "{1}" "{2}\agent.py" >> "{2}\agent-task.log" 2>&1' -f $InstallDir, $pythonPath, $InstallDir)
 
 # Remove old task if exists
@@ -329,6 +384,65 @@ if ($online) {
     Write-Ok "Agent ONLINE in dashboard"
 } else {
     Write-Err "Agent did not become ONLINE. Check $logPath for errors."
+}
+
+# --- 12. Configure Wake-on-LAN at OS level (BIOS still manual) ---
+Write-Step "Configuring Wake-on-LAN (Windows side)"
+
+# 12a. Disable Fast Startup. Required: Fast Startup leaves NIC half-off and breaks WoL.
+try {
+    $powerKey = "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Power"
+    if (-not (Test-Path $powerKey)) { New-Item -Path $powerKey -Force | Out-Null }
+    Set-ItemProperty -Path $powerKey -Name "HiberbootEnabled" -Type DWord -Value 0
+    Write-Ok "Fast Startup disabled"
+} catch {
+    Write-Err ("Failed to disable Fast Startup: " + $_.Exception.Message)
+}
+
+# 12b. Allow each physical wired NIC to wake the PC and respond to magic packets.
+$wolNicCount = 0
+$nics = Get-NetAdapter -Physical -ErrorAction SilentlyContinue |
+    Where-Object { $_.Status -eq "Up" -and $_.MediaType -eq "802.3" }
+
+foreach ($nic in $nics) {
+    try {
+        # Power-management: allow wake + wake on magic packet only
+        Set-NetAdapterPowerManagement -Name $nic.Name `
+            -WakeOnMagicPacket Enabled `
+            -WakeOnPattern Enabled `
+            -DeviceSleepOnDisconnect Disabled `
+            -ErrorAction Stop | Out-Null
+
+        # Vendor-specific advanced properties. Names differ by driver, so try the common keys
+        # and ignore failures silently per key.
+        $advKeys = @(
+            @{ DisplayName = "Wake on Magic Packet"; Value = "Enabled" },
+            @{ DisplayName = "Wake on pattern match"; Value = "Enabled" },
+            @{ DisplayName = "Energy-Efficient Ethernet"; Value = "Disabled" },
+            @{ DisplayName = "Green Ethernet"; Value = "Disabled" }
+        )
+        foreach ($k in $advKeys) {
+            try {
+                Set-NetAdapterAdvancedProperty -Name $nic.Name `
+                    -DisplayName $k.DisplayName `
+                    -DisplayValue $k.Value `
+                    -ErrorAction Stop | Out-Null
+            } catch {
+                # property not supported on this driver, safe to ignore
+            }
+        }
+
+        $wolNicCount++
+        Write-Ok ("WoL enabled on adapter: " + $nic.Name)
+    } catch {
+        Write-Err ("Cannot configure WoL on " + $nic.Name + ": " + $_.Exception.Message)
+    }
+}
+
+if ($wolNicCount -eq 0) {
+    Write-Err "No active wired adapter found. Connect LAN cable and re-run installer for full WoL setup."
+} else {
+    Write-Info "BIOS still needs Wake on LAN / ErP off / Deep Sleep off configured manually."
 }
 
 Write-Step "Done"

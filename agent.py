@@ -33,8 +33,18 @@ def load_config() -> dict:
     if not CONFIG_PATH.exists():
         logger.error("config.json tidak ditemukan di %s", CONFIG_PATH)
         sys.exit(1)
-    with open(CONFIG_PATH) as f:
-        return json.load(f)
+    # utf-8-sig agar BOM dari PowerShell Set-Content -Encoding UTF8 tetap terbaca
+    with open(CONFIG_PATH, encoding="utf-8-sig") as f:
+        try:
+            return json.load(f)
+        except json.JSONDecodeError as exc:
+            logger.error(
+                "config.json tidak valid JSON di %s (%s). "
+                "Re-run installer atau perbaiki file secara manual.",
+                CONFIG_PATH,
+                exc,
+            )
+            sys.exit(1)
 
 
 def get_headers(token: str) -> dict:
