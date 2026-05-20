@@ -60,6 +60,43 @@ def get_headers(token: str) -> dict:
 
 
 def get_mac_address() -> str:
+    local_ip = get_local_ip()
+    stats = psutil.net_if_stats()
+    addresses = psutil.net_if_addrs()
+
+    def format_mac(raw_mac: str) -> str:
+        return raw_mac.replace("-", ":").lower()
+
+    def is_real_mac(raw_mac: str) -> bool:
+        normalized = raw_mac.replace("-", ":").lower()
+        return bool(re.fullmatch(r"[0-9a-f]{2}(:[0-9a-f]{2}){5}", normalized)) and normalized != "00:00:00:00:00:00"
+
+    # Prefer the interface that owns the IP used to reach the backend.
+    for interface_name, interface_addresses in addresses.items():
+        for addr in interface_addresses:
+            if addr.family.name == "AF_INET" and addr.address == local_ip:
+                for mac_addr in interface_addresses:
+                    if mac_addr.family.name in {"AF_LINK", "AF_PACKET"} and is_real_mac(mac_addr.address):
+                        return format_mac(mac_addr.address)
+
+    # Fallback to active wired-like adapters before uuid.getnode(), which can
+    # return Wi-Fi, Bluetooth, or virtual adapter MACs on Windows.
+    wired_keywords = ("ethernet", "realtek", "gbe", "lan", "pci")
+    for interface_name, interface_addresses in addresses.items():
+        stat = stats.get(interface_name)
+        if stat and not stat.isup:
+            continue
+        if not any(keyword in interface_name.lower() for keyword in wired_keywords):
+            continue
+        for addr in interface_addresses:
+            if addr.family.name in {"AF_LINK", "AF_PACKET"} and is_real_mac(addr.address):
+                return format_mac(addr.address)
+
+    for interface_addresses in addresses.values():
+        for addr in interface_addresses:
+            if addr.family.name in {"AF_LINK", "AF_PACKET"} and is_real_mac(addr.address):
+                return format_mac(addr.address)
+
     import uuid
     mac = uuid.getnode()
     return ":".join(f"{(mac >> (8 * i)) & 0xFF:02x}" for i in reversed(range(6)))
