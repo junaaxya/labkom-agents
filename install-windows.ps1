@@ -52,6 +52,30 @@ Write-Step "LabKom PC Agent - Auto Installer"
 Write-Info "Backend: $BaseUrl"
 Write-Info "Install dir: $InstallDir"
 
+# Stop an existing install first so old PC code/token cannot keep running during reinstall.
+$existingTaskName = "LabKom Agent"
+Write-Step "Stopping existing LabKom Agent if present"
+$existingTask = schtasks /query /tn $existingTaskName 2>$null
+if ($LASTEXITCODE -eq 0) {
+    schtasks /end /tn $existingTaskName 2>$null | Out-Null
+    Start-Sleep -Seconds 2
+    Write-Ok "Existing scheduled task stopped"
+} else {
+    Write-Info "No existing scheduled task found"
+}
+
+$installAgentPath = Join-Path $InstallDir "agent.py"
+$runningAgents = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+    Where-Object { $_.CommandLine -and $_.CommandLine -like "*$installAgentPath*" }
+foreach ($proc in $runningAgents) {
+    try {
+        Stop-Process -Id $proc.ProcessId -Force -ErrorAction Stop
+        Write-Ok ("Stopped old agent process PID " + $proc.ProcessId)
+    } catch {
+        Write-Err ("Failed to stop old agent PID " + $proc.ProcessId + ": " + $_.Exception.Message)
+    }
+}
+
 # --- 1. Test backend reachability ---
 Write-Step "Checking backend health"
 try {

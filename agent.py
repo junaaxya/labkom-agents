@@ -6,6 +6,7 @@ import logging
 import os
 import platform
 import secrets
+import shutil
 import subprocess
 import sys
 import time
@@ -197,7 +198,8 @@ def execute_command(cmd: dict) -> tuple[bool, str]:
     elif command_type == "LOCK":
         logger.info("Executing LOCK")
         if platform.system() == "Windows":
-            subprocess.Popen(["rundll32.exe", "user32.dll,LockWorkStation"])
+            result = lock_windows_workstation()
+            return True, result
         else:
             subprocess.Popen(["loginctl", "lock-session"])
         return True, "Lock initiated"
@@ -214,6 +216,17 @@ def execute_command(cmd: dict) -> tuple[bool, str]:
     else:
         logger.warning("Unknown command: %s", command_type)
         return False, f"Unknown command: {command_type}"
+
+
+def lock_windows_workstation() -> str:
+    subprocess.run(["rundll32.exe", "user32.dll,LockWorkStation"], check=False)
+
+    tsdiscon = shutil.which("tsdiscon")
+    if tsdiscon:
+        subprocess.run([tsdiscon], check=False)
+        return "Lock command sent with LockWorkStation and tsdiscon"
+
+    return "Lock command sent with LockWorkStation"
 
 
 def report_result(config: dict, command_id: str, success: bool, result: str):
