@@ -13,6 +13,7 @@
 #   8. Register Windows scheduled task as SYSTEM (auto-start on boot)
 #   9. Run agent, verify it appears Online
 
+[CmdletBinding(PositionalBinding = $false)]
 param(
     [string]$BaseUrl = "http://lab-ilkom.my.id",
     [string]$InstallDir = "C:\labkom-agent",
@@ -40,6 +41,88 @@ function Write-Err($msg) {
     Write-Host ("    ERR " + $msg) -ForegroundColor Red
 }
 
+function Invoke-Schtasks($Arguments, [switch]$AllowFailure) {
+    # Windows PowerShell 5.1 turns native stderr into error records when
+    # $ErrorActionPreference is Stop. Missing tasks are normal during a fresh
+    # install, so run schtasks with a relaxed local preference and inspect the
+    # native exit code ourselves.
+    $previousErrorActionPreference = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try {
+        $output = & schtasks @Arguments 2>&1
+        $exitCode = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $previousErrorActionPreference
+    }
+
+    if ($exitCode -ne 0 -and -not $AllowFailure) {
+        $message = ($output | Out-String).Trim()
+        if (-not $message) { $message = "schtasks exited with code $exitCode" }
+        Write-Err $message
+        exit 1
+    }
+
+    return [pscustomobject]@{
+        ExitCode = $exitCode
+        Output = $output
+    }
+}
+
+function Stop-WithUsage($msg) {
+    Write-Err $msg
+    Write-Info "Correct command:"
+    Write-Host '    powershell -ExecutionPolicy Bypass -File install-windows.ps1 -BaseUrl "http://lab-ilkom.my.id"' -ForegroundColor Yellow
+    Write-Info "Do not add a trailing backslash after the BaseUrl value."
+    exit 1
+}
+
+function Normalize-InstallerInputs {
+    if ([string]::IsNullOrWhiteSpace($BaseUrl)) {
+        Stop-WithUsage "BaseUrl cannot be empty."
+    }
+
+    $script:BaseUrl = $BaseUrl.Trim().TrimEnd("/")
+    $script:InstallDir = $InstallDir.Trim()
+
+    if ([string]::IsNullOrWhiteSpace($script:InstallDir)) {
+        Stop-WithUsage "InstallDir cannot be empty."
+    }
+
+    if ($script:InstallDir -eq "\" -or $script:InstallDir -eq "/") {
+        Stop-WithUsage "Invalid InstallDir '$script:InstallDir'. This usually happens when the command has an extra trailing backslash after BaseUrl."
+    }
+
+    if ($script:InstallDir -match '^[A-Za-z]:\\?$') {
+        Stop-WithUsage "Invalid InstallDir '$script:InstallDir'. Refusing to install directly into a drive root. Use C:\labkom-agent."
+    }
+
+    if ($script:InstallDir.StartsWith("\\")) {
+        Stop-WithUsage "Invalid InstallDir '$script:InstallDir'. UNC/root paths are not supported. Use C:\labkom-agent."
+    }
+
+    if (-not [System.IO.Path]::IsPathRooted($script:InstallDir)) {
+        Stop-WithUsage "InstallDir must be an absolute Windows path. Use C:\labkom-agent."
+    }
+
+    if ($script:InstallDir -match '[<>|?*]') {
+        Stop-WithUsage "InstallDir contains invalid path characters. Use C:\labkom-agent."
+    }
+
+    try {
+        $fullInstallDir = [System.IO.Path]::GetFullPath($script:InstallDir)
+    } catch {
+        Stop-WithUsage ("Invalid InstallDir: " + $_.Exception.Message)
+    }
+
+    if ($fullInstallDir -match '^[A-Za-z]:\\?$') {
+        Stop-WithUsage "Invalid InstallDir '$fullInstallDir'. Refusing to install directly into a drive root. Use C:\labkom-agent."
+    }
+
+    $script:InstallDir = $fullInstallDir.TrimEnd("\")
+}
+
+Normalize-InstallerInputs
+
 # --- 0. Must run as admin ---
 $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
 $principal = New-Object Security.Principal.WindowsPrincipal($identity)
@@ -55,9 +138,9 @@ Write-Info "Install dir: $InstallDir"
 # Stop an existing install first so old PC code/token cannot keep running during reinstall.
 $existingTaskName = "LabKom Agent"
 Write-Step "Stopping existing LabKom Agent if present"
-$existingTask = schtasks /query /tn $existingTaskName 2>$null
-if ($LASTEXITCODE -eq 0) {
-    schtasks /end /tn $existingTaskName 2>$null | Out-Null
+$existingTask = Invoke-Schtasks -Arguments @("/query", "/tn", $existingTaskName) -AllowFailure
+if ($existingTask.ExitCode -eq 0) {
+    Invoke-Schtasks -Arguments @("/end", "/tn", $existingTaskName) -AllowFailure | Out-Null
     Start-Sleep -Seconds 2
     Write-Ok "Existing scheduled task stopped"
 } else {
@@ -363,21 +446,17 @@ $pythonPath = $python
 $cmdArgs = ('/c cd /d "{0}" && "{1}" "{2}\agent.py" >> "{2}\agent-task.log" 2>&1' -f $InstallDir, $pythonPath, $InstallDir)
 
 # Remove old task if exists
-$existingTask = schtasks /query /tn $taskName 2>$null
-if ($LASTEXITCODE -eq 0) {
-    schtasks /delete /tn $taskName /f | Out-Null
+$existingTask = Invoke-Schtasks -Arguments @("/query", "/tn", $taskName) -AllowFailure
+if ($existingTask.ExitCode -eq 0) {
+    Invoke-Schtasks -Arguments @("/delete", "/tn", $taskName, "/f") | Out-Null
 }
 
-$createTask = schtasks /create /tn $taskName /tr ("cmd " + $cmdArgs) /sc onstart /ru SYSTEM /rl HIGHEST /f
-if ($LASTEXITCODE -ne 0) {
-    Write-Err "Failed to create scheduled task"
-    exit 1
-}
+Invoke-Schtasks -Arguments @("/create", "/tn", $taskName, "/tr", ("cmd " + $cmdArgs), "/sc", "onstart", "/ru", "SYSTEM", "/rl", "HIGHEST", "/f") | Out-Null
 Write-Ok "Scheduled task created (runs as SYSTEM at boot)"
 
 # --- 10. Run task now to verify ---
 Write-Step "Run agent now"
-schtasks /run /tn $taskName | Out-Null
+Invoke-Schtasks -Arguments @("/run", "/tn", $taskName) | Out-Null
 Start-Sleep -Seconds 8
 
 $logPath = Join-Path $InstallDir "agent-task.log"
