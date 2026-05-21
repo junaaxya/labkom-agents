@@ -443,7 +443,15 @@ Write-Ok ("config.json written: " + $configPath)
 Write-Step "Register scheduled task LabKom Agent"
 $taskName = "LabKom Agent"
 $pythonPath = $python
-$cmdArgs = ('/c cd /d "{0}" && "{1}" "{2}\agent.py" >> "{2}\agent-task.log" 2>&1' -f $InstallDir, $pythonPath, $InstallDir)
+$runnerPath = Join-Path $InstallDir "run-agent.cmd"
+$runnerContent = @"
+@echo off
+cd /d "$InstallDir"
+"$pythonPath" "$InstallDir\agent.py" >> "$InstallDir\agent-task.log" 2>&1
+"@
+$ansiNoBom = New-Object System.Text.UTF8Encoding($false)
+[System.IO.File]::WriteAllText($runnerPath, $runnerContent, $ansiNoBom)
+$taskCommand = ('cmd.exe /c "{0}"' -f $runnerPath)
 
 # Remove old task if exists
 $existingTask = Invoke-Schtasks -Arguments @("/query", "/tn", $taskName) -AllowFailure
@@ -451,7 +459,7 @@ if ($existingTask.ExitCode -eq 0) {
     Invoke-Schtasks -Arguments @("/delete", "/tn", $taskName, "/f") | Out-Null
 }
 
-Invoke-Schtasks -Arguments @("/create", "/tn", $taskName, "/tr", ("cmd " + $cmdArgs), "/sc", "onstart", "/ru", "SYSTEM", "/rl", "HIGHEST", "/f") | Out-Null
+Invoke-Schtasks -Arguments @("/create", "/tn", $taskName, "/tr", $taskCommand, "/sc", "onstart", "/ru", "SYSTEM", "/rl", "HIGHEST", "/f") | Out-Null
 Write-Ok "Scheduled task created (runs as SYSTEM at boot)"
 
 # --- 10. Run task now to verify ---
