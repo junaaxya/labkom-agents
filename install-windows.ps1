@@ -356,17 +356,66 @@ Write-Ok ("Files copied to " + $InstallDir)
 # --- 7. Install Python deps ---
 Write-Step "Install Python dependencies"
 
-# 7a. Ensure Python is available. Skip if already installed (any 3.x), otherwise download and install silently.
+# 7a. Ensure Python is available. Skip if a real machine-wide 3.x exists,
+# otherwise download and install silently. Do not use Microsoft Store
+# WindowsApps aliases because SYSTEM scheduled tasks cannot execute them.
 function Test-PythonAvailable {
     try {
-        $cmd = Get-Command python -ErrorAction Stop
-        $verLine = & $cmd.Source --version 2>&1
-        if ($verLine -match "Python\s+3\.") {
-            return $cmd.Source
+        $candidates = @()
+
+        foreach ($commandName in @("python", "py")) {
+            $commands = Get-Command $commandName -All -ErrorAction SilentlyContinue
+            foreach ($cmd in $commands) {
+                if ($cmd.Source) { $candidates += $cmd.Source }
+            }
         }
+
+        foreach ($path in @(
+            "$env:ProgramFiles\Python313\python.exe",
+            "$env:ProgramFiles\Python312\python.exe",
+            "$env:ProgramFiles\Python311\python.exe"
+        )) {
+            if ($path -and (Test-Path $path)) { $candidates += $path }
+        }
+
+        foreach ($candidate in ($candidates | Select-Object -Unique)) {
+            if (-not $candidate) { continue }
+            $lowerCandidate = $candidate.ToLowerInvariant()
+            if ($lowerCandidate -like "*\windowsapps\python.exe" -or $lowerCandidate -like "*\windowsapps\python3.exe") {
+                Write-Info ("Skip Microsoft Store Python alias: " + $candidate)
+                continue
+            }
+
+            $verLine = & $candidate --version 2>&1
+            if ($LASTEXITCODE -ne 0) { continue }
+            if ($verLine -match "Python\s+3\.") {
+                return $candidate
+            }
+        }
+
         return $null
     } catch {
         return $null
+    }
+}
+
+function Test-PythonUsableForSystemTask($PythonExe) {
+    if ([string]::IsNullOrWhiteSpace($PythonExe)) { return $false }
+    $lowerPythonExe = $PythonExe.ToLowerInvariant()
+    if ($lowerPythonExe -like "*\windowsapps\python.exe" -or $lowerPythonExe -like "*\windowsapps\python3.exe") {
+        return $false
+    }
+    if (-not (Test-Path $PythonExe)) { return $false }
+
+    try {
+        $verLine = & $PythonExe --version 2>&1
+        if ($LASTEXITCODE -ne 0) { return $false }
+        if ($verLine -match "Python\s+3\.") {
+            return $true
+        }
+        return $false
+    } catch {
+        return $false
     }
 }
 
@@ -405,8 +454,8 @@ if (-not $pythonPath -and -not $SkipPythonInstall) {
     $pythonPath = Test-PythonAvailable
 }
 
-if (-not $pythonPath) {
-    Write-Err "Python 3 still not available after install. Aborting."
+if (-not (Test-PythonUsableForSystemTask $pythonPath)) {
+    Write-Err "Python 3 still not available as a real executable for SYSTEM task. Disable Microsoft Store Python aliases or rerun without -SkipPythonInstall."
     exit 1
 }
 Write-Ok ("Python: " + $pythonPath)
