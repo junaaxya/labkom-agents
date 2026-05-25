@@ -373,15 +373,27 @@ function Test-PythonAvailable {
         foreach ($path in @(
             "$env:ProgramFiles\Python313\python.exe",
             "$env:ProgramFiles\Python312\python.exe",
-            "$env:ProgramFiles\Python311\python.exe"
+            "$env:ProgramFiles\Python311\python.exe",
+            "$env:LOCALAPPDATA\Programs\Python\Python313\python.exe",
+            "$env:LOCALAPPDATA\Programs\Python\Python312\python.exe",
+            "$env:LOCALAPPDATA\Programs\Python\Python311\python.exe"
         )) {
             if ($path -and (Test-Path $path)) { $candidates += $path }
+        }
+
+        foreach ($condaPath in @(
+            "$env:USERPROFILE\anaconda3\python.exe",
+            "$env:USERPROFILE\miniconda3\python.exe",
+            "C:\ProgramData\anaconda3\python.exe",
+            "C:\ProgramData\miniconda3\python.exe"
+        )) {
+            if ($condaPath -and (Test-Path $condaPath)) { $candidates += $condaPath }
         }
 
         foreach ($candidate in ($candidates | Select-Object -Unique)) {
             if (-not $candidate) { continue }
             $lowerCandidate = $candidate.ToLowerInvariant()
-            if ($lowerCandidate -like "*\windowsapps\python.exe" -or $lowerCandidate -like "*\windowsapps\python3.exe") {
+            if ($lowerCandidate -like "*\windowsapps\python.exe" -or $lowerCandidate -like "*\windowsapps\python3.exe" -or $lowerCandidate -like "*\windowsapps\py.exe") {
                 Write-Info ("Skip Microsoft Store Python alias: " + $candidate)
                 continue
             }
@@ -402,7 +414,7 @@ function Test-PythonAvailable {
 function Test-PythonUsableForSystemTask($PythonExe) {
     if ([string]::IsNullOrWhiteSpace($PythonExe)) { return $false }
     $lowerPythonExe = $PythonExe.ToLowerInvariant()
-    if ($lowerPythonExe -like "*\windowsapps\python.exe" -or $lowerPythonExe -like "*\windowsapps\python3.exe") {
+    if ($lowerPythonExe -like "*\windowsapps\*") {
         return $false
     }
     if (-not (Test-Path $PythonExe)) { return $false }
