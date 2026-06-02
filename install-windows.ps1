@@ -363,13 +363,9 @@ function Test-PythonAvailable {
     try {
         $candidates = @()
 
-        foreach ($commandName in @("python", "py")) {
-            $commands = Get-Command $commandName -All -ErrorAction SilentlyContinue
-            foreach ($cmd in $commands) {
-                if ($cmd.Source) { $candidates += $cmd.Source }
-            }
-        }
-
+        # Prefer real python.exe files first. Do not use py.exe: it is a
+        # per-user launcher and often fails from SYSTEM scheduled tasks with
+        # "No installed Python found!" even when it works in the current shell.
         foreach ($path in @(
             "$env:ProgramFiles\Python313\python.exe",
             "$env:ProgramFiles\Python312\python.exe",
@@ -390,10 +386,20 @@ function Test-PythonAvailable {
             if ($condaPath -and (Test-Path $condaPath)) { $candidates += $condaPath }
         }
 
+        $pythonCommands = Get-Command python -All -ErrorAction SilentlyContinue
+        foreach ($cmd in $pythonCommands) {
+            if ($cmd.Source) { $candidates += $cmd.Source }
+        }
+
         foreach ($candidate in ($candidates | Select-Object -Unique)) {
             if (-not $candidate) { continue }
             $lowerCandidate = $candidate.ToLowerInvariant()
-            if ($lowerCandidate -like "*\windowsapps\python.exe" -or $lowerCandidate -like "*\windowsapps\python3.exe" -or $lowerCandidate -like "*\windowsapps\py.exe") {
+            $candidateFileName = [System.IO.Path]::GetFileName($candidate).ToLowerInvariant()
+            if ($candidateFileName -eq "py.exe") {
+                Write-Info ("Skip Python launcher for SYSTEM task: " + $candidate)
+                continue
+            }
+            if ($lowerCandidate -like "*\windowsapps\*") {
                 Write-Info ("Skip Microsoft Store Python alias: " + $candidate)
                 continue
             }
@@ -414,6 +420,10 @@ function Test-PythonAvailable {
 function Test-PythonUsableForSystemTask($PythonExe) {
     if ([string]::IsNullOrWhiteSpace($PythonExe)) { return $false }
     $lowerPythonExe = $PythonExe.ToLowerInvariant()
+    $pythonFileName = [System.IO.Path]::GetFileName($PythonExe).ToLowerInvariant()
+    if ($pythonFileName -eq "py.exe") {
+        return $false
+    }
     if ($lowerPythonExe -like "*\windowsapps\*") {
         return $false
     }
