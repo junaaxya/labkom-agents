@@ -88,11 +88,12 @@ jobs:
             -F "minimumUpdaterVersion=1.0.0" \
             -F "mandatory=false" \
             -F "artifact=@dist/labkom-agent-$VERSION.zip;type=application/zip" || echo "000")"
-          cat /tmp/ci-release-response.json || true
+          RESPONSE_BODY="$(cat /tmp/ci-release-response.json 2>/dev/null || true)"
+          echo "$RESPONSE_BODY"
           if [ "$HTTP_CODE" -ge 200 ] && [ "$HTTP_CODE" -lt 300 ]; then
             echo "Registered release v$VERSION on backend ($HTTP_CODE)."
-          elif [ "$HTTP_CODE" = "404" ] || [ "$HTTP_CODE" = "501" ]; then
-            echo "::warning::Backend CI release endpoint returned HTTP $HTTP_CODE (not deployed yet); GitHub Release is still available."
+          elif [ "$HTTP_CODE" = "404" ] || [ "$HTTP_CODE" = "501" ] || { [ "$HTTP_CODE" = "401" ] && echo "$RESPONSE_BODY" | grep -q "Silakan login"; }; then
+            echo "::warning::Backend CI release endpoint returned HTTP $HTTP_CODE (CI route not deployed yet on backend); GitHub Release v$VERSION is live."
           else
             echo "Backend CI release registration failed with HTTP $HTTP_CODE" >&2
             exit 1
