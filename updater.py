@@ -222,11 +222,22 @@ def start_agent() -> None:
         run_command(["systemctl", "start", "labkom-agent"])
 
 
-def install_dependencies(runtime_dir: Path) -> None:
-    venv_dir = runtime_dir / ".venv"
-    run_command([sys.executable, "-m", "venv", str(venv_dir)])
-    python = venv_dir / ("Scripts/python.exe" if platform.system() == "Windows" else "bin/python")
-    run_command([str(python), "-m", "pip", "install", "-r", str(runtime_dir / "requirements.txt")])
+def install_dependencies(staging_dir: Path) -> None:
+    req_file = staging_dir / "requirements.txt"
+    if not req_file.exists():
+        return
+    try:
+        res = subprocess.run(
+            [sys.executable, "-m", "pip", "install", "--quiet", "-r", str(req_file)],
+            text=True,
+            capture_output=True,
+            timeout=120,
+            check=False,
+        )
+        if res.returncode != 0:
+            print(f"Warning: pip install returned {res.returncode}: {res.stderr.strip()}", file=sys.stderr)
+    except Exception as exc:
+        print(f"Warning: failed to install dependencies: {exc}", file=sys.stderr)
 
 
 def atomic_install(install_dir: Path, staged: Path) -> None:

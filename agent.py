@@ -10,7 +10,11 @@ import secrets
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
+import urllib.parse
+import webbrowser
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -258,9 +262,198 @@ def execute_command(cmd: dict) -> tuple[bool, str]:
             subprocess.Popen(["notify-send", "LabKom Admin", message])
         return True, f"Message displayed: {message}"
 
+    elif command_type == "LIST_PROCESSES":
+        logger.info("Executing LIST_PROCESSES")
+        return True, list_running_processes()
+
+    elif command_type == "KILL_PROCESS":
+        logger.info("Executing KILL_PROCESS")
+        return kill_target_process(payload)
+
+    elif command_type == "OPEN_URL":
+        logger.info("Executing OPEN_URL")
+        return open_target_url(payload)
+
+    elif command_type == "CLEAN_TEMP":
+        logger.info("Executing CLEAN_TEMP")
+        return clean_temp_files()
+
     else:
         logger.warning("Unknown command: %s", command_type)
         return False, f"Unknown command: {command_type}"
+
+
+PROTECTED_PROCESS_NAMES = {
+    "system",
+    "idle",
+    "csrss.exe",
+    "wininit.exe",
+    "winlogon.exe",
+    "services.exe",
+    "lsass.exe",
+    "svchost.exe",
+    "smss.exe",
+}
+
+
+def get_windows_window_titles() -> dict[int, str]:
+    if platform.system() != "Windows":
+        return {}
+    try:
+        res = subprocess.run(
+            [
+                "powershell",
+                "-NoProfile",
+                "-Command",
+                "Get-Process | Where-Object {$_.MainWindowTitle} | Select-Object Id,MainWindowTitle | ConvertTo-Json -Compress",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+        if res.returncode != 0 or not res.stdout.strip():
+            return {}
+        data = json.loads(res.stdout.strip())
+        if isinstance(data, dict):
+            data = [data]
+        return {
+            int(item["Id"]): str(item.get("MainWindowTitle") or "")
+            for item in data
+            if isinstance(item, dict) and "Id" in item
+        }
+    except Exception:
+        return {}
+
+
+def list_running_processes() -> str:
+    titles = get_windows_window_titles()
+    procs = []
+    for proc in psutil.process_iter(["pid", "name", "username", "memory_info", "cpu_percent"]):
+        try:
+            info = proc.info
+            pid = int(info.get("pid") or 0)
+            mem_info = info.get("memory_info")
+            mem_mb = round((mem_info.rss / (1024 * 1024)), 2) if mem_info else 0.0
+            procs.append(
+                {
+                    "pid": pid,
+                    "name": str(info.get("name") or ""),
+                    "windowTitle": titles.get(pid, ""),
+                    "username": str(info.get("username") or ""),
+                    "memoryMb": mem_mb,
+                    "cpuPercent": round(float(info.get("cpu_percent") or 0.0), 2),
+                }
+            )
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess, ValueError):
+            continue
+
+    procs.sort(key=lambda p: (bool(p["windowTitle"]), p["memoryMb"], p["cpuPercent"]), reverse=True)
+    return json.dumps(
+        {
+            "kind": "processes",
+            "capturedAt": datetime.now(timezone.utc).isoformat(),
+            "processes": procs[:60],
+        }
+    )
+
+
+def kill_target_process(payload: dict) -> tuple[bool, str]:
+    raw_pid = payload.get("pid")
+    process_name = str(payload.get("processName") or "").strip()
+    try:
+        pid = int(raw_pid)
+    except (TypeError, ValueError):
+        return False, "Invalid PID"
+
+    if pid <= 0 or pid == os.getpid():
+        return False, f"Cannot terminate protected PID {pid}"
+
+    if process_name.lower() in PROTECTED_PROCESS_NAMES:
+        return False, f"Cannot terminate protected system process: {process_name}"
+
+    try:
+        proc = psutil.Process(pid)
+        actual_name = (proc.name() or "").strip()
+        if actual_name.lower() in PROTECTED_PROCESS_NAMES:
+            return False, f"Cannot terminate protected system process: {actual_name}"
+        proc.terminate()
+        try:
+            proc.wait(timeout=2)
+        except psutil.TimeoutExpired:
+            proc.kill()
+        return True, f"Process {actual_name or process_name or pid} (PID {pid}) terminated"
+    except psutil.NoSuchProcess:
+        return False, f"Process PID {pid} not found"
+    except psutil.AccessDenied:
+        return False, f"Access denied terminating PID {pid}"
+    except Exception as exc:
+        return False, f"Failed to terminate PID {pid}: {exc}"
+
+
+def open_target_url(payload: dict) -> tuple[bool, str]:
+    url = str(payload.get("url") or "").strip()
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return False, "Invalid URL: only http:// and https:// are allowed"
+
+    try:
+        if platform.system() == "Windows":
+            subprocess.Popen(["cmd", "/c", "start", "", url])
+        else:
+            xdg_open = shutil.which("xdg-open")
+            if xdg_open:
+                subprocess.Popen([xdg_open, url])
+            else:
+                webbrowser.open(url)
+        return True, f"Opened URL: {url}"
+    except Exception as exc:
+        return False, f"Failed to open URL: {exc}"
+
+
+def clean_temp_files() -> tuple[bool, str]:
+    temp_dir = Path(tempfile.gettempdir())
+    removed_files = 0
+    freed_bytes = 0
+
+    if temp_dir.exists():
+        for entry in temp_dir.iterdir():
+            try:
+                if entry.is_symlink() or entry.is_file():
+                    size = entry.stat().st_size if not entry.is_symlink() else 0
+                    entry.unlink()
+                    removed_files += 1
+                    freed_bytes += size
+                elif entry.is_dir():
+                    dir_size = 0
+                    dir_files = 0
+                    for sub in entry.rglob("*"):
+                        try:
+                            if sub.is_file() and not sub.is_symlink():
+                                dir_size += sub.stat().st_size
+                                dir_files += 1
+                        except OSError:
+                            pass
+                    shutil.rmtree(entry)
+                    removed_files += max(dir_files, 1)
+                    freed_bytes += dir_size
+            except OSError:
+                continue
+
+    if platform.system() == "Windows":
+        try:
+            subprocess.run(
+                ["powershell", "-NoProfile", "-Command", "Clear-RecycleBin -Force -ErrorAction SilentlyContinue"],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+        except Exception:
+            pass
+
+    freed_mb = round(freed_bytes / (1024 * 1024), 2)
+    return True, f"Cleaned {removed_files} temp items ({freed_mb} MB freed)"
 
 
 def lock_windows_workstation() -> str:
@@ -335,7 +528,7 @@ def main():
     send_log(config, "AGENT_STARTED", "INFO", f"Agent started on {platform.node()}")
 
     heartbeat_interval = config.get("heartbeat_interval", 60)
-    command_interval = config.get("command_poll_interval", 30)
+    command_interval = min(int(config.get("command_poll_interval", 5)), 5)
 
     last_heartbeat = 0
     last_command_poll = 0
@@ -360,7 +553,7 @@ def main():
                 )
             last_command_poll = now
 
-        time.sleep(5)
+        time.sleep(1)
 
 
 if __name__ == "__main__":
