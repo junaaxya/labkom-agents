@@ -214,6 +214,74 @@ class AgentMaintenanceCommandTests(unittest.TestCase):
                 self.assertIn("3.0 MB", msg)
                 mock_run.assert_called_once()
 
+    def test_capture_screen_resizes_and_encodes_jpeg(self):
+        fake_img = mock.MagicMock()
+        fake_img.mode = "RGB"
+        fake_img.size = (1920, 1080)
+        resized_img = mock.MagicMock()
+        resized_img.size = (960, 540)
+
+        def save_jpeg(buf, format, quality):
+            buf.write(b"\xff\xd8\xff\xe0fakejpeg")
+
+        resized_img.save.side_effect = save_jpeg
+        fake_img.resize.return_value = resized_img
+
+        fake_pil_image = mock.MagicMock()
+        fake_pil_image.BICUBIC = 3
+        fake_pil_image_grab = mock.MagicMock()
+        fake_pil_image_grab.grab.return_value = fake_img
+        fake_pil_pkg = mock.MagicMock(Image=fake_pil_image, ImageGrab=fake_pil_image_grab)
+
+        with mock.patch.dict(sys.modules, {"PIL": fake_pil_pkg, "PIL.Image": fake_pil_image, "PIL.ImageGrab": fake_pil_image_grab}), \
+             mock.patch("agent.shutil.which", return_value="/usr/bin/notify-send"), \
+             mock.patch("agent.subprocess.Popen") as mock_popen:
+            ok, result = agent.execute_command({"command": "CAPTURE_SCREEN", "payload": {}})
+            self.assertTrue(ok)
+            mock_popen.assert_called_once()
+            parsed = json.loads(result)
+            self.assertEqual(parsed["kind"], "screen")
+            self.assertEqual(parsed["mimeType"], "image/jpeg")
+            self.assertEqual(parsed["width"], 960)
+            self.assertEqual(parsed["height"], 540)
+            self.assertEqual(parsed["sizeBytes"], len(b"\xff\xd8\xff\xe0fakejpeg"))
+            self.assertEqual(base64.b64decode(parsed["imageBase64"]), b"\xff\xd8\xff\xe0fakejpeg")
+
+    def test_capture_webcam_reads_frames_resizes_and_releases(self):
+        fake_cap = mock.MagicMock()
+        fake_cap.isOpened.return_value = True
+        fake_frame = mock.MagicMock()
+        fake_frame.shape = (720, 1280, 3)
+        fake_cap.read.return_value = (True, fake_frame)
+
+        resized_frame = mock.MagicMock()
+        resized_frame.shape = (360, 640, 3)
+
+        fake_encoded = mock.MagicMock()
+        fake_encoded.tobytes.return_value = b"\xff\xd8\xff\xe0webcamjpeg"
+
+        fake_cv2 = mock.MagicMock()
+        fake_cv2.IMWRITE_JPEG_QUALITY = 1
+        fake_cv2.VideoCapture.return_value = fake_cap
+        fake_cv2.resize.return_value = resized_frame
+        fake_cv2.imencode.return_value = (True, fake_encoded)
+
+        with mock.patch.dict(sys.modules, {"cv2": fake_cv2}), \
+             mock.patch("agent.subprocess.Popen") as mock_popen:
+            ok, result = agent.execute_command({"command": "CAPTURE_WEBCAM", "payload": {"silent": True}})
+            self.assertTrue(ok)
+            mock_popen.assert_not_called()
+            self.assertEqual(fake_cap.read.call_count, 3)
+            fake_cap.release.assert_called_once()
+            fake_cv2.resize.assert_called_once_with(fake_frame, (640, 360))
+            parsed = json.loads(result)
+            self.assertEqual(parsed["kind"], "webcam")
+            self.assertEqual(parsed["mimeType"], "image/jpeg")
+            self.assertEqual(parsed["width"], 640)
+            self.assertEqual(parsed["height"], 360)
+            self.assertEqual(parsed["sizeBytes"], len(b"\xff\xd8\xff\xe0webcamjpeg"))
+            self.assertEqual(base64.b64decode(parsed["imageBase64"]), b"\xff\xd8\xff\xe0webcamjpeg")
+
 
 if __name__ == "__main__":
     unittest.main()

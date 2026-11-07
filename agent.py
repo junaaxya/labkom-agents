@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """LabKom PC Agent - Monitors PC health and executes remote commands."""
 
+import base64
+import io
 import json
 import logging
 import os
@@ -278,6 +280,14 @@ def execute_command(cmd: dict) -> tuple[bool, str]:
         logger.info("Executing CLEAN_TEMP")
         return clean_temp_files()
 
+    elif command_type == "CAPTURE_SCREEN":
+        logger.info("Executing CAPTURE_SCREEN")
+        return capture_screen_diagnostic(payload)
+
+    elif command_type == "CAPTURE_WEBCAM":
+        logger.info("Executing CAPTURE_WEBCAM")
+        return capture_webcam_diagnostic(payload)
+
     else:
         logger.warning("Unknown command: %s", command_type)
         return False, f"Unknown command: {command_type}"
@@ -454,6 +464,110 @@ def clean_temp_files() -> tuple[bool, str]:
 
     freed_mb = round(freed_bytes / (1024 * 1024), 2)
     return True, f"Cleaned {removed_files} temp items ({freed_mb} MB freed)"
+
+
+def notify_lab_inspection(kind: str, payload: dict) -> None:
+    notice = f"Koordinator Lab sedang melakukan pemeriksaan praktikum/ujian ({kind})"
+    logger.info(notice)
+    if payload.get("silent"):
+        return
+    try:
+        if platform.system() != "Windows":
+            notify_bin = shutil.which("notify-send")
+            if notify_bin:
+                subprocess.Popen([notify_bin, "LabKom Exam Monitor", notice])
+    except Exception:
+        pass
+
+
+def capture_screen_diagnostic(payload: dict) -> tuple[bool, str]:
+    notify_lab_inspection("CAPTURE_SCREEN", payload)
+    try:
+        from PIL import Image, ImageGrab
+    except ImportError as exc:
+        return False, f"Pillow is not installed: {exc}"
+
+    try:
+        img = ImageGrab.grab()
+        if img.mode != "RGB":
+            img = img.convert("RGB")
+        w, h = img.size
+        if w > 960:
+            new_h = max(1, int(round(h * (960 / w))))
+            resample = getattr( getattr(Image, "Resampling", Image), "LANCZOS", Image.BICUBIC)
+            img = img.resize((960, new_h), resample)
+            w, h = img.size
+
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=70)
+        raw_bytes = buf.getvalue()
+        return True, json.dumps(
+            {
+                "kind": "screen",
+                "mimeType": "image/jpeg",
+                "capturedAt": datetime.now(timezone.utc).isoformat(),
+                "width": w,
+                "height": h,
+                "sizeBytes": len(raw_bytes),
+                "imageBase64": base64.b64encode(raw_bytes).decode("ascii"),
+            }
+        )
+    except Exception as exc:
+        return False, f"Failed to capture screen: {exc}"
+
+
+def capture_webcam_diagnostic(payload: dict) -> tuple[bool, str]:
+    notify_lab_inspection("CAPTURE_WEBCAM", payload)
+    try:
+        import cv2
+    except ImportError as exc:
+        return False, f"opencv-python-headless is not installed: {exc}"
+
+    cap = None
+    try:
+        cap = cv2.VideoCapture(0)
+        if not cap or not cap.isOpened():
+            return False, "Webcam device not available"
+
+        frame = None
+        for _ in range(3):
+            ok, current = cap.read()
+            if ok and current is not None:
+                frame = current
+
+        if frame is None:
+            return False, "Failed to read frame from webcam"
+
+        h, w = frame.shape[:2]
+        if w > 640:
+            new_h = max(1, int(round(h * (640 / w))))
+            frame = cv2.resize(frame, (640, new_h))
+            h, w = frame.shape[:2]
+
+        ok, encoded = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 70])
+        if not ok:
+            return False, "Failed to encode webcam frame as JPEG"
+
+        raw_bytes = encoded.tobytes()
+        return True, json.dumps(
+            {
+                "kind": "webcam",
+                "mimeType": "image/jpeg",
+                "capturedAt": datetime.now(timezone.utc).isoformat(),
+                "width": int(w),
+                "height": int(h),
+                "sizeBytes": len(raw_bytes),
+                "imageBase64": base64.b64encode(raw_bytes).decode("ascii"),
+            }
+        )
+    except Exception as exc:
+        return False, f"Failed to capture webcam: {exc}"
+    finally:
+        if cap is not None:
+            try:
+                cap.release()
+            except Exception:
+                pass
 
 
 def lock_windows_workstation() -> str:
