@@ -20,7 +20,8 @@ param(
     [string]$PythonVersion = "3.12.6",
     [string]$PythonInstallerUrl = "",
     [string]$ReleasePublicKeyPath = "",
-    [switch]$SkipPythonInstall
+    [switch]$SkipPythonInstall,
+    [switch]$Upgrade
 )
 
 $ErrorActionPreference = "Stop"
@@ -59,8 +60,7 @@ function Invoke-Schtasks($Arguments, [switch]$AllowFailure) {
     if ($exitCode -ne 0 -and -not $AllowFailure) {
         $message = ($output | Out-String).Trim()
         if (-not $message) { $message = "schtasks exited with code $exitCode" }
-        Write-Err $message
-        exit 1
+        throw $message
     }
 
     return [pscustomobject]@{
@@ -124,6 +124,32 @@ function Normalize-InstallerInputs {
 
 Normalize-InstallerInputs
 
+$existingConfig = $null
+if ($Upgrade) {
+    $existingConfigPath = Join-Path $InstallDir "config.json"
+    if (-not (Test-Path -LiteralPath $existingConfigPath -PathType Leaf)) {
+        Stop-WithUsage "Upgrade requested, but existing config was not found at $existingConfigPath."
+    }
+    try {
+        $existingConfig = Get-Content -LiteralPath $existingConfigPath -Raw | ConvertFrom-Json
+    } catch {
+        Stop-WithUsage ("Existing config is invalid JSON: " + $_.Exception.Message)
+    }
+    foreach ($requiredProperty in @("pc_code", "agent_token", "base_url")) {
+        if ([string]::IsNullOrWhiteSpace([string]$existingConfig.$requiredProperty)) {
+            Stop-WithUsage "Existing config is missing required property '$requiredProperty'."
+        }
+    }
+    $configuredApiUrl = [string]$existingConfig.base_url
+    if ($configuredApiUrl -notmatch '^https://') {
+        Stop-WithUsage "Upgrade requires an existing HTTPS base_url. Refusing to reuse credentials over a non-HTTPS endpoint."
+    }
+    $expectedApiUrl = "$BaseUrl/api/v1/pcs"
+    if ($configuredApiUrl.TrimEnd("/") -ne $expectedApiUrl.TrimEnd("/")) {
+        Stop-WithUsage "Existing base_url does not match -BaseUrl. Use the backend already stored in config.json."
+    }
+}
+
 # --- 0. Must run as admin ---
 $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
 $principal = New-Object Security.Principal.WindowsPrincipal($identity)
@@ -136,34 +162,8 @@ Write-Step "LabKom PC Agent - Auto Installer"
 Write-Info "Backend: $BaseUrl"
 Write-Info "Install dir: $InstallDir"
 
-# Stop an existing install first so old PC code/token cannot keep running during reinstall.
 $existingTaskName = "LabKom Agent"
 $existingUpdaterTaskName = "LabKom Agent Updater"
-Write-Step "Stopping existing LabKom Agent if present"
-$existingUpdaterTask = Invoke-Schtasks -Arguments @("/query", "/tn", $existingUpdaterTaskName) -AllowFailure
-if ($existingUpdaterTask.ExitCode -eq 0) {
-    Invoke-Schtasks -Arguments @("/end", "/tn", $existingUpdaterTaskName) -AllowFailure | Out-Null
-    Write-Ok "Existing updater task stopped"
-}
-$existingTask = Invoke-Schtasks -Arguments @("/query", "/tn", $existingTaskName) -AllowFailure
-if ($existingTask.ExitCode -eq 0) {
-    Invoke-Schtasks -Arguments @("/end", "/tn", $existingTaskName) -AllowFailure | Out-Null
-    Start-Sleep -Seconds 2
-    Write-Ok "Existing scheduled task stopped"
-} else {
-    Write-Info "No existing scheduled task found"
-}
-
-$runningAgents = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
-    Where-Object { $_.CommandLine -and $_.CommandLine -like "*$InstallDir*agent.py*" }
-foreach ($proc in $runningAgents) {
-    try {
-        Stop-Process -Id $proc.ProcessId -Force -ErrorAction Stop
-        Write-Ok ("Stopped old agent process PID " + $proc.ProcessId)
-    } catch {
-        Write-Err ("Failed to stop old agent PID " + $proc.ProcessId + ": " + $_.Exception.Message)
-    }
-}
 
 # --- 1. Test backend reachability ---
 Write-Step "Checking backend health"
@@ -175,7 +175,15 @@ try {
     exit 1
 }
 
-# --- 2. Login as Koordinator ---
+# --- 2. Reuse identity for upgrade, or provision a new identity ---
+if ($Upgrade) {
+    Write-Step "Reuse existing agent identity"
+    $pcCode = [string]$existingConfig.pc_code
+    $agentToken = [string]$existingConfig.agent_token
+    $lab = [pscustomobject]@{ name = "existing assignment" }
+    Write-Ok "Existing pc_code and token loaded from local config"
+    Write-Info "Token will not be rotated or printed"
+} else {
 Write-Step "Login Koordinator"
 $email = Read-Host "Email Koordinator"
 $password = Read-Host "Password" -AsSecureString
@@ -340,6 +348,7 @@ if (-not $agentToken) {
     exit 1
 }
 Write-Ok "Token generated"
+}
 
 # --- 6. Prepare versioned runtime layout ---
 Write-Step "Prepare install directory"
@@ -347,7 +356,12 @@ if (-not (Test-Path $InstallDir)) {
     New-Item -ItemType Directory -Path $InstallDir | Out-Null
 }
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
-$currentDir = Join-Path $InstallDir "current"
+$installedCurrentDir = Join-Path $InstallDir "current"
+$currentDir = $installedCurrentDir
+if ($Upgrade) {
+    $currentDir = Join-Path $InstallDir "bootstrap-staging"
+    if (Test-Path $currentDir) { Remove-Item -LiteralPath $currentDir -Recurse -Force }
+}
 if (-not (Test-Path $currentDir)) {
     New-Item -ItemType Directory -Path $currentDir | Out-Null
 }
@@ -517,30 +531,87 @@ $updaterVenv = Join-Path $InstallDir "updater-venv"
 $runtimePython = Join-Path $runtimeVenv "Scripts\python.exe"
 $updaterPython = Join-Path $updaterVenv "Scripts\python.exe"
 & $runtimePython -m pip install -r (Join-Path $currentDir "requirements.txt")
-& $updaterPython -m pip install -r (Join-Path $currentDir "requirements.txt")
-$pipExit = $LASTEXITCODE
+$runtimePipExit = $LASTEXITCODE
+if ($runtimePipExit -eq 0) {
+    & $updaterPython -m pip install -r (Join-Path $currentDir "requirements.txt")
+    $updaterPipExit = $LASTEXITCODE
+} else {
+    $updaterPipExit = 0
+}
 Pop-Location
-if ($pipExit -ne 0) {
-    Write-Err "pip install failed with exit code $pipExit"
+if ($runtimePipExit -ne 0) {
+    Write-Err "Runtime pip install failed with exit code $runtimePipExit"
+    exit 1
+}
+if ($updaterPipExit -ne 0) {
+    Write-Err "Updater pip install failed with exit code $updaterPipExit"
     exit 1
 }
 Write-Ok "Dependencies installed"
 
-# --- 8. Write config.json ---
-Write-Step "Write config.json"
-$config = @{
-    pc_code = $pcCode
-    agent_token = $agentToken
-    base_url = "$BaseUrl/api/v1/pcs"
-    heartbeat_interval = 60
-    command_poll_interval = 30
+# Stop the existing install only after package, backend, Python, and dependencies are ready.
+Write-Step "Stopping existing LabKom Agent if present"
+$existingUpdaterTask = Invoke-Schtasks -Arguments @("/query", "/tn", $existingUpdaterTaskName) -AllowFailure
+if ($existingUpdaterTask.ExitCode -eq 0) {
+    Invoke-Schtasks -Arguments @("/end", "/tn", $existingUpdaterTaskName) -AllowFailure | Out-Null
+    Write-Ok "Existing updater task stopped"
 }
+$existingTask = Invoke-Schtasks -Arguments @("/query", "/tn", $existingTaskName) -AllowFailure
+if ($existingTask.ExitCode -eq 0) {
+    Invoke-Schtasks -Arguments @("/end", "/tn", $existingTaskName) -AllowFailure | Out-Null
+    Start-Sleep -Seconds 2
+    Write-Ok "Existing scheduled task stopped"
+} else {
+    Write-Info "No existing scheduled task found"
+}
+
+$runningAgents = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+    Where-Object { $_.CommandLine -and $_.CommandLine -like "*$InstallDir*agent.py*" }
+foreach ($proc in $runningAgents) {
+    try {
+        Stop-Process -Id $proc.ProcessId -Force -ErrorAction Stop
+        Write-Ok ("Stopped old agent process PID " + $proc.ProcessId)
+    } catch {
+        Write-Err ("Failed to stop old agent PID " + $proc.ProcessId + ": " + $_.Exception.Message)
+    }
+}
+
+if ($Upgrade) {
+    Write-Step "Activate staged runtime"
+    $previousBootstrapDir = Join-Path $InstallDir "bootstrap-previous"
+    if (Test-Path $previousBootstrapDir) { Remove-Item -LiteralPath $previousBootstrapDir -Recurse -Force }
+    if (Test-Path $installedCurrentDir) { Move-Item -LiteralPath $installedCurrentDir -Destination $previousBootstrapDir }
+    try {
+        Move-Item -LiteralPath $currentDir -Destination $installedCurrentDir
+        $currentDir = $installedCurrentDir
+    } catch {
+        if (Test-Path $previousBootstrapDir) {
+            Move-Item -LiteralPath $previousBootstrapDir -Destination $installedCurrentDir
+        }
+        throw
+    }
+}
+
+# --- 8. Write config.json only for a new install ---
 $configPath = Join-Path $InstallDir "config.json"
-$configJson = $config | ConvertTo-Json -Depth 5
-# Write BOM-less UTF-8 so Python json.load can parse it on Windows PowerShell 5.1
-$utf8NoBom = New-Object System.Text.UTF8Encoding($false)
-[System.IO.File]::WriteAllText($configPath, $configJson, $utf8NoBom)
-Write-Ok ("config.json written: " + $configPath)
+if ($Upgrade) {
+    Write-Step "Preserve existing config.json"
+    Write-Ok "Existing identity and token preserved unchanged"
+} else {
+    Write-Step "Write config.json"
+    $config = @{
+        pc_code = $pcCode
+        agent_token = $agentToken
+        base_url = "$BaseUrl/api/v1/pcs"
+        heartbeat_interval = 60
+        command_poll_interval = 30
+    }
+    $configJson = $config | ConvertTo-Json -Depth 5
+    # Write BOM-less UTF-8 so Python json.load can parse it on Windows PowerShell 5.1
+    $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+    [System.IO.File]::WriteAllText($configPath, $configJson, $utf8NoBom)
+    Write-Ok ("config.json written: " + $configPath)
+}
 
 # --- 9. Register Task Scheduler as SYSTEM ---
 Write-Step "Register scheduled task LabKom Agent"
@@ -596,26 +667,43 @@ if (Test-Path $logPath) {
     Write-Info "No log yet. Check Task Scheduler -> $taskName"
 }
 
-# --- 11. Verify online via API ---
-Write-Step "Verifying agent online via dashboard API"
-$online = $false
-for ($i = 0; $i -lt 6; $i++) {
-    Start-Sleep -Seconds 5
-    try {
-        $detail = Invoke-RestMethod -Uri "$BaseUrl/api/v1/pcs/$pcId" -Method GET -Headers $authHeaders
-        $status = $detail.data.agentStatus
-        if (-not $status) { $status = $detail.agentStatus }
-        Write-Info ("Try $($i+1): agentStatus=$status")
-        if ($status -eq "ONLINE") { $online = $true; break }
-    } catch {
-        Write-Info ("Try $($i+1): error " + $_.Exception.Message)
+# --- 11. Verify online for new installs; upgrades have no coordinator credential ---
+if ($Upgrade) {
+    Write-Step "Verify upgraded agent task"
+    $taskStatus = Get-ScheduledTask -TaskName $taskName -ErrorAction Stop
+    if ($taskStatus.State -ne "Running") {
+        Write-Err "Agent task is not running. Check $logPath."
+        exit 1
     }
-}
-
-if ($online) {
-    Write-Ok "Agent ONLINE in dashboard"
+    if (Test-Path $logPath) {
+        $recentLog = Get-Content -LiteralPath $logPath -Tail 20 | Out-String
+        if ($recentLog -match '(?im)(Traceback \(most recent call last\)|ModuleNotFoundError|config\.json tidak valid|Agent token tidak valid)') {
+            Write-Err "Agent log reports a startup or authentication failure. Check $logPath."
+            exit 1
+        }
+    }
+    Write-Ok "Agent task is running; confirm ONLINE in dashboard"
 } else {
-    Write-Err "Agent did not become ONLINE. Check $logPath for errors."
+    Write-Step "Verifying agent online via dashboard API"
+    $online = $false
+    for ($i = 0; $i -lt 6; $i++) {
+        Start-Sleep -Seconds 5
+        try {
+            $detail = Invoke-RestMethod -Uri "$BaseUrl/api/v1/pcs/$pcId" -Method GET -Headers $authHeaders
+            $status = $detail.data.agentStatus
+            if (-not $status) { $status = $detail.agentStatus }
+            Write-Info ("Try $($i+1): agentStatus=$status")
+            if ($status -eq "ONLINE") { $online = $true; break }
+        } catch {
+            Write-Info ("Try $($i+1): error " + $_.Exception.Message)
+        }
+    }
+
+    if ($online) {
+        Write-Ok "Agent ONLINE in dashboard"
+    } else {
+        Write-Err "Agent did not become ONLINE. Check $logPath for errors."
+    }
 }
 
 # --- 12. Configure Wake-on-LAN at OS level (BIOS still manual) ---
