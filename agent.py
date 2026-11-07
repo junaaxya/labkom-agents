@@ -17,8 +17,12 @@ from typing import Optional
 import psutil
 import requests
 
-CONFIG_PATH = Path(__file__).parent / "config.json"
-LOG_DIR = Path(__file__).parent / "logs"
+RUNTIME_DIR = Path(__file__).resolve().parent
+INSTALL_DIR = RUNTIME_DIR.parent if RUNTIME_DIR.name == "current" else RUNTIME_DIR
+CONFIG_PATH = INSTALL_DIR / "config.json"
+VERSION_PATH = RUNTIME_DIR / "VERSION"
+AGENT_VERSION = VERSION_PATH.read_text(encoding="ascii").strip() if VERSION_PATH.exists() else "1.0.0"
+LOG_DIR = INSTALL_DIR / "logs"
 LOG_DIR.mkdir(exist_ok=True)
 
 logging.basicConfig(
@@ -114,7 +118,7 @@ def get_system_info() -> dict:
         "storageTotalGb": round(disk.total / (1024**3), 2),
         "ipAddress": get_local_ip(),
         "macAddress": get_mac_address(),
-        "agentVersion": "1.0.0",
+        "agentVersion": AGENT_VERSION,
     }
 
 
@@ -149,7 +153,7 @@ def get_metrics() -> dict:
         "os": f"{platform.system()} {platform.release()}",
         "architecture": platform.machine(),
         "cpuModel": platform.processor() or "Unknown",
-        "agentVersion": "1.0.0",
+        "agentVersion": AGENT_VERSION,
     }
 
 

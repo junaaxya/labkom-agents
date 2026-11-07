@@ -6,3 +6,5 @@ venv/
 bulk-output/
 bulk-*/
 *-output/
+dist/
+*.private.pem

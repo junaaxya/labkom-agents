@@ -15,10 +15,11 @@
 
 [CmdletBinding(PositionalBinding = $false)]
 param(
-    [string]$BaseUrl = "http://lab-ilkom.my.id",
+    [string]$BaseUrl = "https://lab-ilkom.my.id",
     [string]$InstallDir = "C:\labkom-agent",
     [string]$PythonVersion = "3.12.6",
     [string]$PythonInstallerUrl = "",
+    [string]$ReleasePublicKeyPath = "",
     [switch]$SkipPythonInstall
 )
 
@@ -71,7 +72,7 @@ function Invoke-Schtasks($Arguments, [switch]$AllowFailure) {
 function Stop-WithUsage($msg) {
     Write-Err $msg
     Write-Info "Correct command:"
-    Write-Host '    powershell -ExecutionPolicy Bypass -File install-windows.ps1 -BaseUrl "http://lab-ilkom.my.id"' -ForegroundColor Yellow
+    Write-Host '    powershell -ExecutionPolicy Bypass -File install-windows.ps1 -BaseUrl "https://lab-ilkom.my.id"' -ForegroundColor Yellow
     Write-Info "Do not add a trailing backslash after the BaseUrl value."
     exit 1
 }
@@ -137,7 +138,13 @@ Write-Info "Install dir: $InstallDir"
 
 # Stop an existing install first so old PC code/token cannot keep running during reinstall.
 $existingTaskName = "LabKom Agent"
+$existingUpdaterTaskName = "LabKom Agent Updater"
 Write-Step "Stopping existing LabKom Agent if present"
+$existingUpdaterTask = Invoke-Schtasks -Arguments @("/query", "/tn", $existingUpdaterTaskName) -AllowFailure
+if ($existingUpdaterTask.ExitCode -eq 0) {
+    Invoke-Schtasks -Arguments @("/end", "/tn", $existingUpdaterTaskName) -AllowFailure | Out-Null
+    Write-Ok "Existing updater task stopped"
+}
 $existingTask = Invoke-Schtasks -Arguments @("/query", "/tn", $existingTaskName) -AllowFailure
 if ($existingTask.ExitCode -eq 0) {
     Invoke-Schtasks -Arguments @("/end", "/tn", $existingTaskName) -AllowFailure | Out-Null
@@ -147,9 +154,8 @@ if ($existingTask.ExitCode -eq 0) {
     Write-Info "No existing scheduled task found"
 }
 
-$installAgentPath = Join-Path $InstallDir "agent.py"
 $runningAgents = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
-    Where-Object { $_.CommandLine -and $_.CommandLine -like "*$installAgentPath*" }
+    Where-Object { $_.CommandLine -and $_.CommandLine -like "*$InstallDir*agent.py*" }
 foreach ($proc in $runningAgents) {
     try {
         Stop-Process -Id $proc.ProcessId -Force -ErrorAction Stop
@@ -335,23 +341,43 @@ if (-not $agentToken) {
 }
 Write-Ok "Token generated"
 
-# --- 6. Prepare install dir ---
+# --- 6. Prepare versioned runtime layout ---
 Write-Step "Prepare install directory"
 if (-not (Test-Path $InstallDir)) {
     New-Item -ItemType Directory -Path $InstallDir | Out-Null
 }
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+$currentDir = Join-Path $InstallDir "current"
+if (-not (Test-Path $currentDir)) {
+    New-Item -ItemType Directory -Path $currentDir | Out-Null
+}
 
-$filesToCopy = @("agent.py", "requirements.txt")
-foreach ($f in $filesToCopy) {
+$runtimeFiles = @("agent.py", "requirements.txt", "VERSION")
+foreach ($f in $runtimeFiles) {
     $src = Join-Path $scriptDir $f
     if (-not (Test-Path $src)) {
         Write-Err "Missing $f next to install-windows.ps1"
         exit 1
     }
-    Copy-Item $src $InstallDir -Force
+    Copy-Item $src $currentDir -Force
 }
-Write-Ok ("Files copied to " + $InstallDir)
+
+$updaterSource = Join-Path $scriptDir "updater.py"
+if (-not (Test-Path $updaterSource)) {
+    Write-Err "Missing updater.py next to install-windows.ps1"
+    exit 1
+}
+Copy-Item $updaterSource $InstallDir -Force
+
+if ([string]::IsNullOrWhiteSpace($ReleasePublicKeyPath)) {
+    $ReleasePublicKeyPath = Join-Path $scriptDir "release-public-key.pem"
+}
+if (-not (Test-Path $ReleasePublicKeyPath)) {
+    Write-Err "Missing Ed25519 release public key. Pass -ReleasePublicKeyPath or place release-public-key.pem next to installer."
+    exit 1
+}
+Copy-Item $ReleasePublicKeyPath (Join-Path $InstallDir "release-public-key.pem") -Force
+Write-Ok ("Versioned runtime prepared in " + $currentDir)
 
 # --- 7. Install Python deps ---
 Write-Step "Install Python dependencies"
@@ -484,8 +510,14 @@ Write-Ok ("Python: " + $pythonPath)
 
 $python = $pythonPath
 Push-Location $InstallDir
-& $python -m pip install --upgrade pip | Out-Null
-& $python -m pip install -r requirements.txt
+$runtimeVenv = Join-Path $currentDir ".venv"
+$updaterVenv = Join-Path $InstallDir "updater-venv"
+& $python -m venv $runtimeVenv
+& $python -m venv $updaterVenv
+$runtimePython = Join-Path $runtimeVenv "Scripts\python.exe"
+$updaterPython = Join-Path $updaterVenv "Scripts\python.exe"
+& $runtimePython -m pip install -r (Join-Path $currentDir "requirements.txt")
+& $updaterPython -m pip install -r (Join-Path $currentDir "requirements.txt")
 $pipExit = $LASTEXITCODE
 Pop-Location
 if ($pipExit -ne 0) {
@@ -515,10 +547,11 @@ Write-Step "Register scheduled task LabKom Agent"
 $taskName = "LabKom Agent"
 $pythonPath = $python
 $runnerPath = Join-Path $InstallDir "run-agent.cmd"
+$runtimePython = Join-Path $currentDir ".venv\Scripts\python.exe"
 $runnerContent = @"
 @echo off
 cd /d "$InstallDir"
-"$pythonPath" "$InstallDir\agent.py" >> "$InstallDir\agent-task.log" 2>&1
+"$runtimePython" "$currentDir\agent.py" >> "$InstallDir\agent-task.log" 2>&1
 "@
 $ansiNoBom = New-Object System.Text.UTF8Encoding($false)
 [System.IO.File]::WriteAllText($runnerPath, $runnerContent, $ansiNoBom)
@@ -532,6 +565,23 @@ if ($existingTask.ExitCode -eq 0) {
 
 Invoke-Schtasks -Arguments @("/create", "/tn", $taskName, "/tr", $taskCommand, "/sc", "onstart", "/ru", "SYSTEM", "/rl", "HIGHEST", "/f") | Out-Null
 Write-Ok "Scheduled task created (runs as SYSTEM at boot)"
+
+# Updater is separate so it can restore previous runtime when the new agent fails.
+$updaterTaskName = "LabKom Agent Updater"
+$updaterRunnerPath = Join-Path $InstallDir "run-updater.cmd"
+$updaterRunnerContent = @"
+@echo off
+cd /d "$InstallDir"
+"$updaterPython" "$InstallDir\updater.py" --install-dir "$InstallDir" >> "$InstallDir\updater-task.log" 2>&1
+"@
+[System.IO.File]::WriteAllText($updaterRunnerPath, $updaterRunnerContent, $ansiNoBom)
+$updaterTaskCommand = ('cmd.exe /c "{0}"' -f $updaterRunnerPath)
+$existingUpdaterTask = Invoke-Schtasks -Arguments @("/query", "/tn", $updaterTaskName) -AllowFailure
+if ($existingUpdaterTask.ExitCode -eq 0) {
+    Invoke-Schtasks -Arguments @("/delete", "/tn", $updaterTaskName, "/f") | Out-Null
+}
+Invoke-Schtasks -Arguments @("/create", "/tn", $updaterTaskName, "/tr", $updaterTaskCommand, "/sc", "minute", "/mo", "10", "/ru", "SYSTEM", "/rl", "HIGHEST", "/f") | Out-Null
+Write-Ok "Updater task created (runs as SYSTEM every 10 minutes)"
 
 # --- 10. Run task now to verify ---
 Write-Step "Run agent now"
@@ -633,5 +683,6 @@ Write-Info ("Lab            : " + $lab.name)
 Write-Info ("Install dir    : " + $InstallDir)
 Write-Info ("Config         : " + $configPath)
 Write-Info ("Task Scheduler : " + $taskName)
+Write-Info ("Updater Task   : " + $updaterTaskName)
 Write-Info ("Log file       : " + $logPath)
 Write-Info ("Dashboard      : $BaseUrl/pc-monitoring")

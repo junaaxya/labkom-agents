@@ -2,11 +2,11 @@
 
 # LabKom PC Agent - Auto Installer for Linux
 # Run with sudo from the labkom-agent folder:
-#   sudo ./install-linux.sh --base-url http://lab-ilkom.my.id
+#   sudo ./install-linux.sh --base-url https://lab-ilkom.my.id
 
 set -euo pipefail
 
-BASE_URL="http://lab-ilkom.my.id"
+BASE_URL="https://lab-ilkom.my.id"
 INSTALL_DIR="/opt/labkom-agent"
 SERVICE_NAME="labkom-agent"
 
@@ -25,7 +25,7 @@ while [[ $# -gt 0 ]]; do
 LabKom Linux Agent Auto Installer
 
 Usage:
-  sudo ./install-linux.sh --base-url http://lab-ilkom.my.id
+  sudo ./install-linux.sh --base-url https://lab-ilkom.my.id
 
 Options:
   --base-url     Backend/frontend root URL, without /api/v1 (default: $BASE_URL)
@@ -57,7 +57,7 @@ if ! command -v systemctl >/dev/null 2>&1; then
   exit 1
 fi
 
-for required_file in agent.py requirements.txt; do
+for required_file in agent.py requirements.txt VERSION updater.py release-public-key.pem; do
   if [[ ! -f "${SCRIPT_DIR}/${required_file}" ]]; then
     echo "ERR Missing ${required_file} next to install-linux.sh" >&2
     exit 1
@@ -235,14 +235,25 @@ AGENT_BASE_URL="$(${PYTHON_BIN} -c 'import json,sys; print(json.load(open(sys.ar
 
 echo ""
 echo "[INSTALL] Preparing files"
-mkdir -p "${INSTALL_DIR}" "${INSTALL_DIR}/logs"
-cp "${SCRIPT_DIR}/agent.py" "${INSTALL_DIR}/agent.py"
-cp "${SCRIPT_DIR}/requirements.txt" "${INSTALL_DIR}/requirements.txt"
+systemctl stop "${SERVICE_NAME}-updater.timer" "${SERVICE_NAME}-updater.service" 2>/dev/null || true
+if [[ -e "${INSTALL_DIR}/updater.lock" ]]; then
+  echo "ERR Updater is currently running; retry installation after it finishes." >&2
+  exit 1
+fi
+mkdir -p "${INSTALL_DIR}/current" "${INSTALL_DIR}/logs"
+cp "${SCRIPT_DIR}/agent.py" "${INSTALL_DIR}/current/agent.py"
+cp "${SCRIPT_DIR}/requirements.txt" "${INSTALL_DIR}/current/requirements.txt"
+cp "${SCRIPT_DIR}/VERSION" "${INSTALL_DIR}/current/VERSION"
+cp "${SCRIPT_DIR}/updater.py" "${INSTALL_DIR}/updater.py"
+cp "${SCRIPT_DIR}/release-public-key.pem" "${INSTALL_DIR}/release-public-key.pem"
 chmod 700 "${INSTALL_DIR}"
+chmod 600 "${INSTALL_DIR}/release-public-key.pem"
 
 echo "[INSTALL] Installing Python dependencies"
-"${PYTHON_BIN}" -m pip install --upgrade pip >/dev/null
-"${PYTHON_BIN}" -m pip install -r "${INSTALL_DIR}/requirements.txt"
+"${PYTHON_BIN}" -m venv "${INSTALL_DIR}/current/.venv"
+"${PYTHON_BIN}" -m venv "${INSTALL_DIR}/updater-venv"
+"${INSTALL_DIR}/current/.venv/bin/python" -m pip install -r "${INSTALL_DIR}/current/requirements.txt"
+"${INSTALL_DIR}/updater-venv/bin/python" -m pip install -r "${INSTALL_DIR}/current/requirements.txt"
 
 echo "[INSTALL] Writing config.json"
 RESULT_PATH="${TMP_RESULT}" INSTALL_DIR="${INSTALL_DIR}" "${PYTHON_BIN}" <<'PY'
@@ -273,7 +284,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 WorkingDirectory=${INSTALL_DIR}
-ExecStart=${PYTHON_BIN} ${INSTALL_DIR}/agent.py
+ExecStart="${INSTALL_DIR}/current/.venv/bin/python" "${INSTALL_DIR}/current/agent.py"
 Restart=always
 RestartSec=10
 User=root
@@ -282,8 +293,35 @@ User=root
 WantedBy=multi-user.target
 EOF
 
+cat > "/etc/systemd/system/${SERVICE_NAME}-updater.service" <<EOF
+[Unit]
+Description=LabKom PC Agent Updater
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=${INSTALL_DIR}
+ExecStart="${INSTALL_DIR}/updater-venv/bin/python" "${INSTALL_DIR}/updater.py" --install-dir "${INSTALL_DIR}"
+User=root
+EOF
+
+cat > "/etc/systemd/system/${SERVICE_NAME}-updater.timer" <<EOF
+[Unit]
+Description=Check LabKom PC Agent updates
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=10min
+RandomizedDelaySec=60
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+
 systemctl daemon-reload
 systemctl enable "${SERVICE_NAME}" >/dev/null
+systemctl enable --now "${SERVICE_NAME}-updater.timer" >/dev/null
 systemctl restart "${SERVICE_NAME}"
 
 echo ""

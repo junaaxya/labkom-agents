@@ -118,6 +118,26 @@ Frekuensi rotasi yang disarankan:
 - Tiap akhir semester, sebelum lab dipakai kelas baru.
 - Ketika menarik PC keluar dari pool aktif (token harus di-revoke; jalankan generate ulang dan jangan distribusikan token barunya).
 
+## Signed Agent Updates
+
+Runtime terpasang pada `current/`; `config.json`, updater, public key, dan log tetap di luar runtime agar update tidak menimpa identitas PC.
+
+Build release memakai private Ed25519 key yang disimpan di luar repository:
+
+```bash
+python build-release.py --private-key /secure/path/release-private.pem
+```
+
+Hasil `dist/<version>/` berisi `labkom-agent.zip` dan `manifest.json`. Upload keduanya tanpa mengubah isi. Installer membutuhkan public key pasangannya bernama `release-public-key.pem` di sebelah installer, atau Windows menerima `-ReleasePublicKeyPath`.
+
+Updater mengecek `/api/v1/pcs/agent/update` setiap 10 menit, memverifikasi HTTPS, host, ukuran, SHA-256, dan signature, lalu memasang secara atomic. Versi sebelumnya disimpan pada `previous/` dan otomatis dipulihkan jika heartbeat versi target tidak dikonfirmasi backend.
+
+Uji lokal:
+
+```bash
+python -m unittest -v test_updater.py
+```
+
 ## Troubleshooting
 
 | Masalah | Solusi |
