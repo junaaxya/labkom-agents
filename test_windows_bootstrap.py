@@ -86,6 +86,39 @@ class WindowsBootstrapTests(unittest.TestCase):
                 self.assertEqual(package.read("release-public-key.pem"), public_key_path.read_bytes())
             self.assertTrue(checksum.read_text(encoding="ascii").endswith(f"  {archive.name}\n"))
 
+    def test_release_workflow_and_cli_builder_contract(self) -> None:
+        workflow_path = ROOT / ".github" / "workflows" / "release-agent.yml"
+        self.assertTrue(workflow_path.is_file())
+        workflow = workflow_path.read_text(encoding="utf-8")
+        self.assertIn("branches:\n      - main", workflow)
+        self.assertIn("- \"VERSION\"", workflow)
+        self.assertIn("workflow_dispatch:", workflow)
+        self.assertIn("python3 -m unittest -v test_updater.py test_windows_bootstrap.py", workflow)
+        self.assertIn('python3 build-release.py --version "$VERSION" --output "dist/labkom-agent-$VERSION.zip"', workflow)
+        self.assertIn("python3 build-windows-bootstrap.py --public-key release-public-key.pem", workflow)
+        self.assertIn('gh release create "v$VERSION"', workflow)
+        self.assertIn("/api/v1/pcs/agent-updates/releases/ci", workflow)
+        self.assertIn("X-Agent-CI-Token: $LABKOM_CI_RELEASE_TOKEN", workflow)
+
+        with tempfile.TemporaryDirectory() as temp:
+            out_zip = Path(temp) / "labkom-agent-1.1.0.zip"
+            subprocess.run(
+                [
+                    sys.executable,
+                    str(ROOT / "build-release.py"),
+                    "--version",
+                    "1.1.0",
+                    "--output",
+                    str(out_zip),
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            self.assertTrue(out_zip.is_file())
+            with zipfile.ZipFile(out_zip) as archive:
+                self.assertEqual(set(archive.namelist()), {"agent.py", "requirements.txt", "updater.py", "VERSION"})
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,0 +1,99 @@
+name: Release LabKom Agent
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "VERSION"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install build & test dependencies
+        run: |
+          python3 -m pip install --upgrade pip
+          python3 -m pip install -r requirements.txt
+
+      - name: Read VERSION
+        id: version
+        run: |
+          VERSION="$(tr -d '[:space:]' < VERSION)"
+          if ! [[ "$VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "Invalid SemVer in VERSION: $VERSION" >&2
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Run unit tests
+        run: python3 -m unittest -v test_updater.py test_windows_bootstrap.py
+
+      - name: Build release and Windows bootstrap packages
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          python3 build-release.py --version "$VERSION" --output "dist/labkom-agent-$VERSION.zip"
+          python3 build-windows-bootstrap.py --public-key release-public-key.pem
+
+      - name: Create or update GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          if gh release view "v$VERSION" >/dev/null 2>&1; then
+            gh release upload "v$VERSION" \
+              "dist/labkom-agent-$VERSION.zip" \
+              "dist/LabKom-Agent-Windows-Upgrade-v$VERSION.zip" \
+              "dist/LabKom-Agent-Windows-Upgrade-v$VERSION.zip.sha256" \
+              --clobber
+          else
+            gh release create "v$VERSION" \
+              "dist/labkom-agent-$VERSION.zip" \
+              "dist/LabKom-Agent-Windows-Upgrade-v$VERSION.zip" \
+              "dist/LabKom-Agent-Windows-Upgrade-v$VERSION.zip.sha256" \
+              --title "LabKom Agent v$VERSION" \
+              --generate-notes
+          fi
+
+      - name: Register and publish release in ManagementLab-Web
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          LABKOM_BACKEND_URL: ${{ secrets.LABKOM_BACKEND_URL }}
+          LABKOM_CI_RELEASE_TOKEN: ${{ secrets.LABKOM_CI_RELEASE_TOKEN }}
+        run: |
+          if [ -z "$LABKOM_BACKEND_URL" ] || [ -z "$LABKOM_CI_RELEASE_TOKEN" ]; then
+            echo "LABKOM_BACKEND_URL or LABKOM_CI_RELEASE_TOKEN not configured; skipping backend CI registration."
+            exit 0
+          fi
+          BACKEND_URL="${LABKOM_BACKEND_URL%/}"
+          HTTP_CODE="$(curl --silent --show-error --output /tmp/ci-release-response.json --write-out "%{http_code}" -X POST \
+            "$BACKEND_URL/api/v1/pcs/agent-updates/releases/ci" \
+            -H "X-Agent-CI-Token: $LABKOM_CI_RELEASE_TOKEN" \
+            -F "version=$VERSION" \
+            -F "platform=windows" \
+            -F "architecture=x86_64" \
+            -F "minimumUpdaterVersion=1.0.0" \
+            -F "mandatory=false" \
+            -F "artifact=@dist/labkom-agent-$VERSION.zip;type=application/zip" || echo "000")"
+          cat /tmp/ci-release-response.json || true
+          if [ "$HTTP_CODE" -ge 200 ] && [ "$HTTP_CODE" -lt 300 ]; then
+            echo "Registered release v$VERSION on backend ($HTTP_CODE)."
+          elif [ "$HTTP_CODE" = "404" ] || [ "$HTTP_CODE" = "501" ]; then
+            echo "::warning::Backend CI release endpoint returned HTTP $HTTP_CODE (not deployed yet); GitHub Release is still available."
+          else
+            echo "Backend CI release registration failed with HTTP $HTTP_CODE" >&2
+            exit 1
+          fi
