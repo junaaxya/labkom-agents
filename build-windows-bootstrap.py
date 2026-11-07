@@ -48,7 +48,7 @@ def main() -> int:
 
     version = (ROOT / "VERSION").read_text(encoding="ascii").strip()
     args.out.mkdir(parents=True, exist_ok=True)
-    archive_path = args.out / f"labkom-agent-windows-bootstrap-{version}.zip"
+    archive_path = args.out / f"LabKom-Agent-Windows-Upgrade-v{version}.zip"
     if archive_path.exists():
         raise SystemExit(f"Refusing to overwrite existing output: {archive_path}")
 

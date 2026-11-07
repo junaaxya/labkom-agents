@@ -20,6 +20,7 @@ import requests
 RUNTIME_DIR = Path(__file__).resolve().parent
 INSTALL_DIR = RUNTIME_DIR.parent if RUNTIME_DIR.name == "current" else RUNTIME_DIR
 CONFIG_PATH = INSTALL_DIR / "config.json"
+PROGRAM_DATA_CONFIG_PATH = Path(os.environ.get("ProgramData", r"C:\ProgramData")) / "LabKom Agent" / "config.json"
 VERSION_PATH = RUNTIME_DIR / "VERSION"
 AGENT_VERSION = VERSION_PATH.read_text(encoding="ascii").strip() if VERSION_PATH.exists() else "1.0.0"
 LOG_DIR = INSTALL_DIR / "logs"
@@ -37,18 +38,19 @@ logger = logging.getLogger("labkom-agent")
 
 
 def load_config() -> dict:
-    if not CONFIG_PATH.exists():
+    config_file = CONFIG_PATH if CONFIG_PATH.exists() else PROGRAM_DATA_CONFIG_PATH
+    if not config_file.exists():
         logger.error("config.json tidak ditemukan di %s", CONFIG_PATH)
         sys.exit(1)
     # utf-8-sig agar BOM dari PowerShell Set-Content -Encoding UTF8 tetap terbaca
-    with open(CONFIG_PATH, encoding="utf-8-sig") as f:
+    with open(config_file, encoding="utf-8-sig") as f:
         try:
             return json.load(f)
         except json.JSONDecodeError as exc:
             logger.error(
                 "config.json tidak valid JSON di %s (%s). "
                 "Re-run installer atau perbaiki file secara manual.",
-                CONFIG_PATH,
+                config_file,
                 exc,
             )
             sys.exit(1)

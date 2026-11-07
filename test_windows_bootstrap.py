@@ -31,7 +31,9 @@ class WindowsBootstrapTests(unittest.TestCase):
         self.assertIn("set \"elevate_exit=%errorlevel%\"", launcher)
         self.assertIn("exit /b %elevate_exit%", launcher)
         self.assertIn("-executionpolicy bypass", launcher)
+        self.assertIn("%programdata%\\labkom agent\\config.json", launcher)
         self.assertIn("-upgrade", launcher)
+        self.assertIn("-interactivefresh", launcher)
         self.assertIn("exit /b %install_exit%", launcher)
         self.assertIn("install-latest.log", launcher)
         self.assertNotIn("net session", launcher)
@@ -47,6 +49,8 @@ class WindowsBootstrapTests(unittest.TestCase):
         self.assertIn('$runtimePipExit = $LASTEXITCODE', installer)
         self.assertIn('$updaterPipExit = $LASTEXITCODE', installer)
         self.assertIn('$taskStatus.State -ne "Running"', installer)
+        self.assertIn("Provisioning Token", installer)
+        self.assertIn("C:\\ProgramData\\LabKom Agent", installer)
         self.assertLess(installer.index('Write-Ok "Dependencies installed"'), installer.index('Write-Step "Stopping existing LabKom Agent if present"'))
         self.assertNotIn("generate-token", upgrade_block.split("} else {", 1)[0])
 

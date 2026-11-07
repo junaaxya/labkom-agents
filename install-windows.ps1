@@ -20,27 +20,47 @@ param(
     [string]$PythonVersion = "3.12.6",
     [string]$PythonInstallerUrl = "",
     [string]$ReleasePublicKeyPath = "",
+    [string]$PcCode = "",
+    [string]$ProvisioningToken = "",
+    [string]$LogPath = "",
     [switch]$SkipPythonInstall,
-    [switch]$Upgrade
+    [switch]$Upgrade,
+    [switch]$InteractiveFresh
 )
 
 $ErrorActionPreference = "Stop"
 
+function Write-LogLine([string]$line) {
+    if (-not [string]::IsNullOrWhiteSpace($LogPath)) {
+        try {
+            $logDir = Split-Path -Parent $LogPath
+            if ($logDir -and -not (Test-Path -LiteralPath $logDir)) {
+                New-Item -ItemType Directory -Path $logDir -Force | Out-Null
+            }
+            Add-Content -LiteralPath $LogPath -Value $line -Encoding UTF8 -ErrorAction SilentlyContinue
+        } catch {}
+    }
+}
+
 function Write-Step($msg) {
     Write-Host ""
     Write-Host ("[INSTALL] " + $msg) -ForegroundColor Cyan
+    Write-LogLine ("[INSTALL] " + $msg)
 }
 
 function Write-Info($msg) {
     Write-Host ("    " + $msg) -ForegroundColor Gray
+    Write-LogLine ("    " + $msg)
 }
 
 function Write-Ok($msg) {
     Write-Host ("    OK  " + $msg) -ForegroundColor Green
+    Write-LogLine ("    OK  " + $msg)
 }
 
 function Write-Err($msg) {
     Write-Host ("    ERR " + $msg) -ForegroundColor Red
+    Write-LogLine ("    ERR " + $msg)
 }
 
 function Invoke-Schtasks($Arguments, [switch]$AllowFailure) {
@@ -124,11 +144,22 @@ function Normalize-InstallerInputs {
 
 Normalize-InstallerInputs
 
+if (-not [string]::IsNullOrWhiteSpace($LogPath) -and (Test-Path -LiteralPath $LogPath)) {
+    Remove-Item -LiteralPath $LogPath -Force -ErrorAction SilentlyContinue
+}
+
+$programDataConfigDir = "C:\ProgramData\LabKom Agent"
+$programDataConfigPath = Join-Path $programDataConfigDir "config.json"
+
 $existingConfig = $null
 if ($Upgrade) {
     $existingConfigPath = Join-Path $InstallDir "config.json"
     if (-not (Test-Path -LiteralPath $existingConfigPath -PathType Leaf)) {
-        Stop-WithUsage "Upgrade requested, but existing config was not found at $existingConfigPath."
+        if (Test-Path -LiteralPath $programDataConfigPath -PathType Leaf) {
+            $existingConfigPath = $programDataConfigPath
+        } else {
+            Stop-WithUsage "Upgrade requested, but existing config was not found at $existingConfigPath or $programDataConfigPath."
+        }
     }
     try {
         $existingConfig = Get-Content -LiteralPath $existingConfigPath -Raw | ConvertFrom-Json
@@ -158,6 +189,30 @@ if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administra
     exit 1
 }
 
+if (-not $Upgrade -and $InteractiveFresh) {
+    Write-Step "New PC Detected - Interactive Fresh Provisioning"
+    $inputBaseUrl = Read-Host "Base URL [$BaseUrl]"
+    if (-not [string]::IsNullOrWhiteSpace($inputBaseUrl)) {
+        $BaseUrl = $inputBaseUrl.Trim()
+        Normalize-InstallerInputs
+    }
+    if ($BaseUrl -notmatch '^https://') {
+        Stop-WithUsage "Fresh install requires an HTTPS BaseUrl."
+    }
+    if ([string]::IsNullOrWhiteSpace($PcCode)) {
+        $PcCode = (Read-Host "PC Code (contoh: PC-LABM-01)").Trim()
+    }
+    if ([string]::IsNullOrWhiteSpace($PcCode)) {
+        Stop-WithUsage "PC Code tidak boleh kosong."
+    }
+    if ([string]::IsNullOrWhiteSpace($ProvisioningToken)) {
+        $ProvisioningToken = (Read-Host "Provisioning Token").Trim()
+    }
+    if ([string]::IsNullOrWhiteSpace($ProvisioningToken)) {
+        Stop-WithUsage "Provisioning Token tidak boleh kosong."
+    }
+}
+
 Write-Step "LabKom PC Agent - Auto Installer"
 Write-Info "Backend: $BaseUrl"
 Write-Info "Install dir: $InstallDir"
@@ -175,6 +230,8 @@ try {
     exit 1
 }
 
+$directTokenProvisioning = (-not $Upgrade) -and (-not [string]::IsNullOrWhiteSpace($PcCode)) -and (-not [string]::IsNullOrWhiteSpace($ProvisioningToken))
+
 # --- 2. Reuse identity for upgrade, or provision a new identity ---
 if ($Upgrade) {
     Write-Step "Reuse existing agent identity"
@@ -183,6 +240,13 @@ if ($Upgrade) {
     $lab = [pscustomobject]@{ name = "existing assignment" }
     Write-Ok "Existing pc_code and token loaded from local config"
     Write-Info "Token will not be rotated or printed"
+} elseif ($directTokenProvisioning) {
+    Write-Step "Fresh install with PC Code and Provisioning Token"
+    $pcCode = $PcCode.Trim()
+    $agentToken = $ProvisioningToken.Trim()
+    $lab = [pscustomobject]@{ name = "fresh provisioning" }
+    Write-Ok "PC Code set to $pcCode"
+    Write-Info "Provisioning token loaded (not printed)"
 } else {
 Write-Step "Login Koordinator"
 $email = Read-Host "Email Koordinator"
@@ -594,8 +658,17 @@ if ($Upgrade) {
 
 # --- 8. Write config.json only for a new install ---
 $configPath = Join-Path $InstallDir "config.json"
+$utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+if (-not (Test-Path -LiteralPath $programDataConfigDir)) {
+    New-Item -ItemType Directory -Path $programDataConfigDir -Force | Out-Null
+}
 if ($Upgrade) {
     Write-Step "Preserve existing config.json"
+    if (-not (Test-Path -LiteralPath $configPath -PathType Leaf) -and (Test-Path -LiteralPath $programDataConfigPath -PathType Leaf)) {
+        Copy-Item -LiteralPath $programDataConfigPath -Destination $configPath -Force
+    } elseif ((Test-Path -LiteralPath $configPath -PathType Leaf) -and -not (Test-Path -LiteralPath $programDataConfigPath -PathType Leaf)) {
+        Copy-Item -LiteralPath $configPath -Destination $programDataConfigPath -Force
+    }
     Write-Ok "Existing identity and token preserved unchanged"
 } else {
     Write-Step "Write config.json"
@@ -608,8 +681,8 @@ if ($Upgrade) {
     }
     $configJson = $config | ConvertTo-Json -Depth 5
     # Write BOM-less UTF-8 so Python json.load can parse it on Windows PowerShell 5.1
-    $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
     [System.IO.File]::WriteAllText($configPath, $configJson, $utf8NoBom)
+    [System.IO.File]::WriteAllText($programDataConfigPath, $configJson, $utf8NoBom)
     Write-Ok ("config.json written: " + $configPath)
 }
 
@@ -667,9 +740,9 @@ if (Test-Path $logPath) {
     Write-Info "No log yet. Check Task Scheduler -> $taskName"
 }
 
-# --- 11. Verify online for new installs; upgrades have no coordinator credential ---
-if ($Upgrade) {
-    Write-Step "Verify upgraded agent task"
+# --- 11. Verify online for new installs; upgrades and direct token installs have no coordinator credential ---
+if ($Upgrade -or $directTokenProvisioning) {
+    Write-Step "Verify agent task"
     $taskStatus = Get-ScheduledTask -TaskName $taskName -ErrorAction Stop
     if ($taskStatus.State -ne "Running") {
         Write-Err "Agent task is not running. Check $logPath."

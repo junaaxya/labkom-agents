@@ -12,8 +12,10 @@ Paket ini memigrasikan instalasi lama di `C:\labkom-agent` ke layout self-update
 
 1. Ekstrak seluruh ZIP ke satu folder lokal. Jangan jalankan langsung dari dalam ZIP.
 2. Opsional tetapi disarankan: verifikasi checksum ZIP dari file `.sha256`:
-   `certutil -hashfile labkom-agent-windows-bootstrap-VERSION.zip SHA256`
+   `certutil -hashfile LabKom-Agent-Windows-Upgrade-v1.1.0.zip SHA256`
 3. Double-click `Install-LabKom-Agent.bat`.
+   - **PC Lama (sudah ada `config.json`)**: otomatis jalan mode `-Upgrade` tanpa tanya input apa pun.
+   - **PC Baru (belum ada `config.json`)**: otomatis masuk mode fresh install interaktif dan meminta `Base URL` (default `https://lab-ilkom.my.id`), `PC Code`, serta `Provisioning Token`.
 4. Setujui UAC. Jendela tetap terbuka dan menampilkan hasil.
 5. Bila gagal, baca `%ProgramData%\LabKom Agent\Bootstrap Logs\install-latest.log`.
 6. Konfirmasi `pc-labm-01` ONLINE di dashboard dan periksa dua task: `LabKom Agent` serta `LabKom Agent Updater`.

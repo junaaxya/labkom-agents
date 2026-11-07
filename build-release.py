@@ -57,7 +57,10 @@ def main() -> int:
         json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n",
         encoding="utf-8",
     )
+    versioned_artifact = args.out / f"labkom-agent-{version}.zip"
+    versioned_artifact.write_bytes(artifact.read_bytes())
     print(release_dir)
+    print(versioned_artifact)
     return 0
 
 

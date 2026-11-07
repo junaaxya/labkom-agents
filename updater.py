@@ -399,7 +399,13 @@ def main() -> int:
     parser.add_argument("--install-dir", type=Path, default=Path(__file__).resolve().parent)
     args = parser.parse_args()
     install_dir = args.install_dir.resolve()
-    config = json.loads((install_dir / "config.json").read_text(encoding="utf-8-sig"))
+    config_path = install_dir / "config.json"
+    if not config_path.exists():
+        program_data = Path(os.environ.get("ProgramData", r"C:\ProgramData"))
+        alt_config = program_data / "LabKom Agent" / "config.json"
+        if alt_config.exists():
+            config_path = alt_config
+    config = json.loads(config_path.read_text(encoding="utf-8-sig"))
     lock_path = install_dir / "updater.lock"
     lock_fd = acquire_lock(lock_path)
     try:
