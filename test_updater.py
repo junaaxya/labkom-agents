@@ -205,6 +205,37 @@ class UpdaterTests(unittest.TestCase):
 
 
 class AgentLoopTests(unittest.TestCase):
+    def test_command_exception_is_reported_without_stopping_agent(self):
+        config = {"heartbeat_interval": 1, "command_poll_interval": 5}
+        stop_event = threading.Event()
+        reports = []
+        polls = 0
+
+        def fake_poll(_config):
+            nonlocal polls
+            polls += 1
+            if polls == 1:
+                return [{"id": "bad", "command": "CAPTURE_SCREEN"}]
+            stop_event.set()
+            return []
+
+        with mock.patch("agent.send_heartbeat"), \
+             mock.patch("agent.poll_commands", side_effect=fake_poll), \
+             mock.patch("agent.execute_command", side_effect=RuntimeError("capture crashed")), \
+             mock.patch("agent.report_result", side_effect=lambda *args: reports.append(args)), \
+             mock.patch("agent.logger.error") as log_error, \
+             mock.patch("agent.send_log"), \
+             mock.patch.object(stop_event, "wait", side_effect=lambda _timeout: False):
+            agent.run_agent(config, stop_event)
+
+        self.assertEqual(polls, 2)
+        self.assertEqual(reports[0][1:3], ("bad", False))
+        self.assertIn("RuntimeError: capture crashed", reports[0][3])
+        self.assertIn(
+            mock.call("Command %s (%s) failed: %s", "CAPTURE_SCREEN", "bad", reports[0][3]),
+            log_error.call_args_list,
+        )
+
     def test_slow_command_does_not_block_or_duplicate_heartbeat(self):
         config = {"heartbeat_interval": 1, "command_poll_interval": 5}
         stop_event = threading.Event()
@@ -244,6 +275,65 @@ class AgentLoopTests(unittest.TestCase):
         self.assertEqual(len(heartbeat_times), 2)
         self.assertGreaterEqual(heartbeat_times[1] - heartbeat_times[0], 0.8)
         self.assertEqual(poll_count, 1)
+
+
+class WindowsInteractiveCaptureTests(unittest.TestCase):
+    def test_task_uses_active_user_without_password_or_trigger(self):
+        runs = [
+            subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr=""),
+            subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr=""),
+        ]
+        with tempfile.TemporaryDirectory() as tmp, \
+             mock.patch("agent.INSTALL_DIR", Path(tmp)), \
+             mock.patch("agent.RUNTIME_DIR", Path(tmp) / "current"), \
+             mock.patch("agent.platform.system", return_value="Windows"), \
+             mock.patch("agent.is_windows_session_zero", return_value=True), \
+             mock.patch("agent.get_active_windows_session_id", return_value="2"), \
+             mock.patch("agent.subprocess.run", side_effect=runs) as run:
+            self.assertTrue(agent.ensure_windows_interactive_capture_task())
+
+        registration = run.call_args_list[1].args[0][-1]
+        self.assertIn("-LogonType Interactive", registration)
+        self.assertIn("-ExecutionTimeLimit", registration)
+        self.assertNotIn("-Password", registration)
+        self.assertNotIn("New-ScheduledTaskTrigger", registration)
+        self.assertIn("SessionId -eq 2", registration)
+
+    def test_session_zero_capture_runs_bounded_interactive_task(self):
+        result = {
+            "nonce": "a" * 32,
+            "success": True,
+            "result": '{"kind":"screen"}',
+        }
+        with tempfile.TemporaryDirectory() as tmp, \
+             mock.patch("agent.INSTALL_DIR", Path(tmp)), \
+             mock.patch("agent.ensure_windows_interactive_capture_task", return_value=True), \
+             mock.patch("agent.secrets.token_hex", return_value="a" * 32), \
+             mock.patch("agent.subprocess.run") as run, \
+             mock.patch("agent.time.sleep", side_effect=lambda _delay: (Path(tmp) / "interactive-capture" / "result.json").write_text(json.dumps(result))):
+            run.return_value = subprocess.CompletedProcess(args=[], returncode=0, stdout="SUCCESS", stderr="")
+            ok, payload = agent.run_windows_interactive_capture("CAPTURE_SCREEN")
+
+        self.assertTrue(ok)
+        self.assertEqual(payload, result["result"])
+        run.assert_called_once_with(
+            ["schtasks", "/run", "/tn", "LabKom Agent Interactive Capture"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+
+    def test_interactive_helper_rejects_unknown_request(self):
+        with tempfile.TemporaryDirectory() as tmp, mock.patch("agent.INSTALL_DIR", Path(tmp)):
+            capture_dir = Path(tmp) / "interactive-capture"
+            capture_dir.mkdir()
+            (Path(tmp) / "interactive-capture-request.json").write_text(json.dumps({"kind": "SHELL", "nonce": "a" * 32}))
+            self.assertEqual(agent.interactive_capture_main(), 1)
+            result = json.loads((capture_dir / "result.json").read_text())
+
+        self.assertFalse(result["success"])
+        self.assertIn("Invalid interactive capture request", result["result"])
 
 
 class AgentMaintenanceCommandTests(unittest.TestCase):
@@ -386,7 +476,7 @@ class AgentMaintenanceCommandTests(unittest.TestCase):
              mock.patch("agent.subprocess.Popen") as mock_popen:
             ok, result = agent.execute_command({"command": "CAPTURE_WEBCAM", "payload": {"silent": True}})
             self.assertTrue(ok)
-            mock_popen.assert_not_called()
+            mock_popen.assert_called_once()
             self.assertEqual(fake_cap.read.call_count, 3)
             fake_cap.release.assert_called_once()
             fake_cv2.resize.assert_called_once_with(fake_frame, (640, 360))

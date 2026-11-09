@@ -30,7 +30,7 @@ CONFIG_PATH = INSTALL_DIR / "config.json"
 PROGRAM_DATA_CONFIG_PATH = Path(os.environ.get("ProgramData", r"C:\ProgramData")) / "LabKom Agent" / "config.json"
 VERSION_PATH = RUNTIME_DIR / "VERSION"
 AGENT_VERSION = VERSION_PATH.read_text(encoding="ascii").strip() if VERSION_PATH.exists() else "1.0.0"
-LOG_DIR = INSTALL_DIR / "logs"
+LOG_DIR = INSTALL_DIR / ("interactive-capture" if "--interactive-capture" in sys.argv else "logs")
 LOG_DIR.mkdir(exist_ok=True)
 
 logging.basicConfig(
@@ -470,10 +470,10 @@ def clean_temp_files() -> tuple[bool, str]:
 def notify_lab_inspection(kind: str, payload: dict) -> None:
     notice = f"Koordinator Lab sedang melakukan pemeriksaan praktikum/ujian ({kind})"
     logger.info(notice)
-    if payload.get("silent"):
-        return
     try:
-        if platform.system() != "Windows":
+        if platform.system() == "Windows":
+            subprocess.Popen(["msg.exe", "*", notice])
+        else:
             notify_bin = shutil.which("notify-send")
             if notify_bin:
                 subprocess.Popen([notify_bin, "LabKom Exam Monitor", notice])
@@ -495,10 +495,133 @@ def is_windows_session_zero() -> bool:
         return False
 
 
+def ensure_windows_agent_task_resilience() -> None:
+    if platform.system() != "Windows" or not is_windows_session_zero():
+        return
+    script = (
+        "$t=Get-ScheduledTask -TaskName 'LabKom Agent' -ErrorAction Stop;"
+        "$t.Settings.RestartCount=3;$t.Settings.RestartInterval='PT1M';"
+        "$t.Settings.ExecutionTimeLimit='PT0S';Set-ScheduledTask -InputObject $t | Out-Null"
+    )
+    try:
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+        if result.returncode != 0:
+            logger.warning("Could not set agent task restart policy: %s", (result.stderr or result.stdout).strip())
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        logger.warning("Could not set agent task restart policy: %s", exc)
+
+
+def ensure_windows_interactive_capture_task() -> bool:
+    if platform.system() != "Windows" or not is_windows_session_zero():
+        return False
+    capture_dir = INSTALL_DIR / "interactive-capture"
+    runner_path = INSTALL_DIR / "run-interactive-capture.cmd"
+    try:
+        capture_dir.mkdir(exist_ok=True)
+        runner_path.write_text(
+            f'@echo off\r\n"{sys.executable}" "{RUNTIME_DIR / "agent.py"}" --interactive-capture\r\n',
+            encoding="utf-8",
+        )
+        acl = subprocess.run(
+            ["icacls", str(capture_dir), "/grant", "*S-1-5-4:(OI)(CI)M"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        if acl.returncode != 0:
+            raise OSError((acl.stderr or acl.stdout).strip() or f"icacls exited {acl.returncode}")
+
+        def ps_quote(value: str) -> str:
+            return value.replace("'", "''")
+
+        session_id = get_active_windows_session_id()
+        if not session_id:
+            raise OSError("No active Windows user session")
+        script = (
+            f"$proc=Get-CimInstance Win32_Process -Filter \"Name='explorer.exe'\" | Where-Object {{$_.SessionId -eq {session_id}}} | Select-Object -First 1;"
+            "if(-not $proc){throw 'Active session has no Explorer process'};"
+            "$owner=Invoke-CimMethod -InputObject $proc -MethodName GetOwner;"
+            "$user=if($owner.Domain){$owner.Domain+'\\'+$owner.User}else{$owner.User};"
+            f"$a=New-ScheduledTaskAction -Execute 'cmd.exe' -Argument '/c \"\"{ps_quote(str(runner_path))}\"\"';"
+            "$p=New-ScheduledTaskPrincipal -UserId $user -LogonType Interactive -RunLevel Limited;"
+            "$s=New-ScheduledTaskSettingsSet -ExecutionTimeLimit (New-TimeSpan -Minutes 1) "
+            "-MultipleInstances IgnoreNew -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries;"
+            "Register-ScheduledTask -TaskName 'LabKom Agent Interactive Capture' -Action $a "
+            "-Principal $p -Settings $s -Force | Out-Null"
+        )
+        registered = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
+            capture_output=True,
+            text=True,
+            timeout=20,
+            check=False,
+        )
+        if registered.returncode != 0:
+            raise OSError((registered.stderr or registered.stdout).strip() or f"PowerShell exited {registered.returncode}")
+        logger.info("Interactive capture task ready (demand-only, one-minute limit)")
+        return True
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        logger.error("Could not prepare interactive capture task: %s", exc)
+        return False
+
+
+def run_windows_interactive_capture(kind: str) -> tuple[bool, str]:
+    if not ensure_windows_interactive_capture_task():
+        return False, "Interactive capture unavailable; confirm an active unlocked Windows user session"
+    capture_dir = INSTALL_DIR / "interactive-capture"
+    request_path = INSTALL_DIR / "interactive-capture-request.json"
+    result_path = capture_dir / "result.json"
+    nonce = secrets.token_hex(16)
+    try:
+        capture_dir.mkdir(exist_ok=True)
+        result_path.unlink(missing_ok=True)
+        request_path.write_text(json.dumps({"kind": kind, "nonce": nonce}), encoding="utf-8")
+        started = subprocess.run(
+            ["schtasks", "/run", "/tn", "LabKom Agent Interactive Capture"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        if started.returncode != 0:
+            detail = (started.stderr or started.stdout).strip()
+            return False, f"Interactive capture task could not start: {detail or started.returncode}"
+
+        deadline = time.monotonic() + 45
+        while time.monotonic() < deadline:
+            if result_path.exists():
+                if result_path.stat().st_size > 8 * 1024 * 1024:
+                    return False, "Interactive capture result exceeds size limit"
+                result = json.loads(result_path.read_text(encoding="utf-8"))
+                if result.get("nonce") != nonce:
+                    return False, "Interactive capture returned an invalid nonce"
+                return bool(result.get("success")), str(result.get("result") or "")
+            time.sleep(0.25)
+        subprocess.run(
+            ["schtasks", "/end", "/tn", "LabKom Agent Interactive Capture"],
+            capture_output=True,
+            timeout=10,
+            check=False,
+        )
+        return False, "Interactive capture timed out; confirm an active unlocked Windows user session"
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        return False, f"Interactive capture failed: {exc}"
+    finally:
+        request_path.unlink(missing_ok=True)
+        result_path.unlink(missing_ok=True)
+
+
 def capture_screen_diagnostic(payload: dict) -> tuple[bool, str]:
-    notify_lab_inspection("CAPTURE_SCREEN", payload)
     if is_windows_session_zero():
-        return False, "Screen capture unavailable from Windows SYSTEM Session 0"
+        return run_windows_interactive_capture("CAPTURE_SCREEN")
+    notify_lab_inspection("CAPTURE_SCREEN", payload)
     try:
         from PIL import Image, ImageGrab
     except ImportError as exc:
@@ -534,9 +657,9 @@ def capture_screen_diagnostic(payload: dict) -> tuple[bool, str]:
 
 
 def capture_webcam_diagnostic(payload: dict) -> tuple[bool, str]:
-    notify_lab_inspection("CAPTURE_WEBCAM", payload)
     if is_windows_session_zero():
-        return False, "Webcam capture unavailable from Windows SYSTEM Session 0"
+        return run_windows_interactive_capture("CAPTURE_WEBCAM")
+    notify_lab_inspection("CAPTURE_WEBCAM", payload)
     try:
         import cv2
     except ImportError as exc:
@@ -651,6 +774,34 @@ def send_log(config: dict, event_type: str, level: str, message: str):
         pass
 
 
+def interactive_capture_main() -> int:
+    capture_dir = INSTALL_DIR / "interactive-capture"
+    request_path = INSTALL_DIR / "interactive-capture-request.json"
+    result_path = capture_dir / "result.json"
+    try:
+        request = json.loads(request_path.read_text(encoding="utf-8"))
+        kind = request.get("kind")
+        nonce = str(request.get("nonce") or "")
+        if kind not in {"CAPTURE_SCREEN", "CAPTURE_WEBCAM"} or not re.fullmatch(r"[0-9a-f]{32}", nonce):
+            raise ValueError("Invalid interactive capture request")
+        if kind == "CAPTURE_SCREEN":
+            success, result = capture_screen_diagnostic({"silent": True})
+        else:
+            success, result = capture_webcam_diagnostic({"silent": True})
+        output = {"nonce": nonce, "success": success, "result": result}
+    except Exception as exc:
+        output = {"nonce": locals().get("nonce", ""), "success": False, "result": f"Interactive helper failed: {exc}"}
+
+    temp_path = result_path.with_suffix(".tmp")
+    try:
+        temp_path.write_text(json.dumps(output), encoding="utf-8")
+        os.replace(temp_path, result_path)
+        return 0 if output["success"] else 1
+    except OSError as exc:
+        logger.error("Interactive helper could not write result: %s", exc)
+        return 1
+
+
 def heartbeat_loop(config: dict, stop_event: threading.Event) -> None:
     # Keep three heartbeat opportunities inside the backend's 90-second offline window.
     interval = min(30, max(1, int(config.get("heartbeat_interval", 30))))
@@ -675,16 +826,29 @@ def run_agent(config: dict, stop_event: threading.Event) -> None:
 
     try:
         while not stop_event.is_set():
-            commands = poll_commands(config)
+            try:
+                commands = poll_commands(config)
+            except Exception:
+                logger.exception("Unexpected command polling error")
+                commands = []
             for cmd in commands:
-                success, result = execute_command(cmd)
-                report_result(config, cmd["id"], success, result)
-                send_log(
-                    config,
-                    "COMMAND_EXECUTED" if success else "COMMAND_FAILED",
-                    "INFO" if success else "ERROR",
-                    f"{cmd.get('command')}: {result}",
-                )
+                try:
+                    success, result = execute_command(cmd)
+                except Exception as exc:
+                    logger.exception("Unexpected command error for %s", cmd.get("command"))
+                    success, result = False, f"Unexpected command error: {type(exc).__name__}: {exc}"
+                if not success:
+                    logger.error("Command %s (%s) failed: %s", cmd.get("command"), cmd.get("id"), result)
+                try:
+                    report_result(config, cmd["id"], success, result)
+                    send_log(
+                        config,
+                        "COMMAND_EXECUTED" if success else "COMMAND_FAILED",
+                        "INFO" if success else "ERROR",
+                        f"{cmd.get('command')}: {result}",
+                    )
+                except Exception:
+                    logger.exception("Unexpected command reporting error for %s", cmd.get("id"))
             stop_event.wait(command_interval)
     finally:
         stop_event.set()
@@ -694,6 +858,8 @@ def run_agent(config: dict, stop_event: threading.Event) -> None:
 def main():
     config = load_config()
     logger.info("LabKom Agent starting for PC: %s", config["pc_code"])
+    ensure_windows_agent_task_resilience()
+    ensure_windows_interactive_capture_task()
 
     if not register(config):
         logger.warning("Registration failed, will retry on next heartbeat")
@@ -703,4 +869,6 @@ def main():
 
 
 if __name__ == "__main__":
+    if "--interactive-capture" in sys.argv:
+        raise SystemExit(interactive_capture_main())
     main()

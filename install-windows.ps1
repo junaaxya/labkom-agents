@@ -715,7 +715,12 @@ if ($existingTask.ExitCode -eq 0) {
 }
 
 Invoke-Schtasks -Arguments @("/create", "/tn", $taskName, "/tr", $taskCommand, "/sc", "onstart", "/ru", "SYSTEM", "/rl", "HIGHEST", "/f") | Out-Null
-Write-Ok "Scheduled task created (runs as SYSTEM at boot)"
+$agentTask = Get-ScheduledTask -TaskName $taskName -ErrorAction Stop
+$agentTask.Settings.RestartCount = 3
+$agentTask.Settings.RestartInterval = "PT1M"
+$agentTask.Settings.ExecutionTimeLimit = "PT0S"
+Set-ScheduledTask -InputObject $agentTask | Out-Null
+Write-Ok "Scheduled task created (SYSTEM at boot, restart on failure)"
 
 # Updater is separate so it can restore previous runtime when the new agent fails.
 $updaterTaskName = "LabKom Agent Updater"

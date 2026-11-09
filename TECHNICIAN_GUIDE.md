@@ -92,16 +92,29 @@ Status harus berubah menjadi `Online` dalam ±1 menit.
 ### Windows
 
 ```powershell
-schtasks /query /tn "LabKom Agent" /v /fo LIST
-schtasks /run /tn "LabKom Agent"
-tasklist | findstr python
-Get-Content C:\labkom-agent\agent-task.log -Tail 30
+Get-Content C:\labkom-agent\agent-task.log -Tail 100
+Get-Content C:\labkom-agent\logs\agent.log -Tail 100
+Get-ScheduledTaskInfo -TaskName "LabKom Agent" | Format-List LastRunTime,LastTaskResult,NextRunTime,NumberOfMissedRuns
+Get-ScheduledTaskInfo -TaskName "LabKom Agent Interactive Capture" | Format-List LastRunTime,LastTaskResult,NextRunTime,NumberOfMissedRuns
+Get-WinEvent -FilterHashtable @{LogName='Microsoft-Windows-TaskScheduler/Operational'; StartTime=(Get-Date).AddHours(-2)} |
+  Where-Object { $_.Message -match 'LabKom Agent' } |
+  Select-Object TimeCreated,Id,LevelDisplayName,Message | Format-List
+```
+
+Hasil command lengkap (tanpa token) ada di log agent:
+
+```powershell
+Select-String -Path C:\labkom-agent\logs\agent.log -Pattern 'Executing CAPTURE_|Command CAPTURE_|Unexpected command error' -Context 0,3
 ```
 
 Kode penting:
 
-- `0x0`: task sukses.
-- `0x41301`: task sedang running.
+- `0x0`: task selesai sukses.
+- `0x1`: proses task keluar dengan error; cek `agent-task.log` dan event Task Scheduler.
+- `0x41301`: task sedang running (normal untuk task agent utama).
+- `0x41303`: task belum pernah dijalankan.
+
+Task `LabKom Agent Interactive Capture` hanya demand-start saat command capture masuk, berjalan sebagai user aktif tanpa menyimpan password, menampilkan notifikasi, lalu berhenti maksimal satu menit.
 
 ### Linux
 
@@ -116,7 +129,7 @@ sudo systemctl restart labkom-agent
 ### Backend tidak bisa diakses
 
 ```bash
-curl http://lab-ilkom.my.id/api/v1/health
+curl https://lab-ilkom.my.id/api/v1/health
 ```
 
 Jika gagal, cek jaringan PC lab, DNS, atau server.
@@ -125,14 +138,14 @@ Jika gagal, cek jaringan PC lab, DNS, atau server.
 
 - Pastikan akun adalah `KOORDINATOR_LAB`.
 - Pastikan email/password benar.
-- Pastikan backend `http://lab-ilkom.my.id/api/v1/health` aktif.
+- Pastikan backend `https://lab-ilkom.my.id/api/v1/health` aktif.
 
 ### Agent tetap Offline
 
 1. Cek `config.json`:
    - `pc_code` harus sama dengan kode PC di dashboard.
    - `agent_token` harus token hasil generate terakhir.
-   - `base_url` harus `http://lab-ilkom.my.id/api/v1/pcs`.
+   - `base_url` harus `https://lab-ilkom.my.id/api/v1/pcs`.
 2. Restart agent:
    - Windows: `schtasks /run /tn "LabKom Agent"`
    - Linux: `sudo systemctl restart labkom-agent`
