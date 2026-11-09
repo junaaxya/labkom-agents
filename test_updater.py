@@ -27,6 +27,21 @@ class UpdaterTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             updater.parse_version("1.2")
 
+    def test_canonical_manifest_matches_backend_contract(self):
+        release = {
+            "version": "1.2.2",
+            "sha256": "a" * 64,
+            "sizeBytes": 12345,
+            "minimumUpdaterVersion": "1.0.0",
+            "platform": "windows",
+            "architecture": "x86_64",
+            "mandatory": False,
+        }
+        self.assertEqual(
+            updater.canonical_manifest(release),
+            b'{"artifact":"labkom-agent.zip","minimumUpdaterVersion":"1.0.0","sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","sizeBytes":12345,"version":"1.2.2"}\n',
+        )
+
     def test_signature_and_hash(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -52,6 +67,63 @@ class UpdaterTests(unittest.TestCase):
             release["version"] = "1.1.1"
             with self.assertRaises(ValueError):
                 updater.verify_signature(release, public_path)
+
+    def test_download_release_authenticates_backend_request(self):
+        config = {
+            "pc_code": "PC-LABM-10",
+            "agent_token": "test-token-not-logged",
+        }
+        url = "https://lab-ilkom.my.id/api/v1/pcs/agent/releases/1.2.2/download?pcCode=PC-LABM-10"
+        payload = b"signed artifact"
+        response = mock.MagicMock()
+        response.headers = {"Content-Length": str(len(payload))}
+        response.iter_content.return_value = [payload]
+        session = mock.MagicMock()
+        session.get.return_value.__enter__.return_value = response
+
+        with tempfile.TemporaryDirectory() as tmp, \
+             mock.patch("updater.time.time", return_value=123.456), \
+             mock.patch("secrets.token_hex", return_value="fixed-nonce"):
+            destination = Path(tmp) / "artifact.zip"
+            updater.download_release(
+                session,
+                config,
+                "1.2.1",
+                url,
+                destination,
+                len(payload),
+                "lab-ilkom.my.id",
+            )
+
+        session.get.assert_called_once_with(
+            url,
+            headers={
+                "Authorization": "Bearer test-token-not-logged",
+                "Content-Type": "application/json",
+                "X-Agent-Timestamp": "123456",
+                "X-Agent-Nonce": "fixed-nonce",
+                "X-Agent-Version": "1.2.1",
+                "X-Updater-Version": updater.UPDATER_VERSION,
+            },
+            stream=True,
+            timeout=(15, 120),
+            allow_redirects=False,
+        )
+        response.raise_for_status.assert_called_once_with()
+
+    def test_download_release_rejects_mismatched_pc_code(self):
+        config = {"pc_code": "PC-LABM-10", "agent_token": "token"}
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaisesRegex(ValueError, "pcCode"):
+                updater.download_release(
+                    mock.MagicMock(),
+                    config,
+                    "1.2.1",
+                    "https://lab-ilkom.my.id/api/v1/pcs/agent/releases/1.2.2/download?pcCode=PC-LABM-11",
+                    Path(tmp) / "artifact.zip",
+                    1,
+                    "lab-ilkom.my.id",
+                )
 
     def test_safe_zip_extracts_exact_runtime(self):
         with tempfile.TemporaryDirectory() as tmp:

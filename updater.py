@@ -181,12 +181,29 @@ def report_status(
     response.raise_for_status()
 
 
-def download_release(session: requests.Session, url: str, destination: Path, size: int, host: str) -> None:
+def download_release(
+    session: requests.Session,
+    config: dict[str, Any],
+    agent_version: str,
+    url: str,
+    destination: Path,
+    size: int,
+    host: str,
+) -> None:
     if size < 1 or size > MAX_ARTIFACT_BYTES:
         raise ValueError("Release size is outside allowed range")
     require_https(url, host)
+    query = urllib.parse.parse_qs(urllib.parse.urlparse(url).query)
+    if query.get("pcCode") != [config["pc_code"]]:
+        raise ValueError("Release URL pcCode does not match agent config")
     downloaded = 0
-    with session.get(url, stream=True, timeout=(15, 120), allow_redirects=False) as response:
+    with session.get(
+        url,
+        headers=get_headers(config["agent_token"], agent_version),
+        stream=True,
+        timeout=(15, 120),
+        allow_redirects=False,
+    ) as response:
         response.raise_for_status()
         declared = response.headers.get("Content-Length")
         if declared and int(declared) != size:
@@ -342,7 +359,15 @@ def perform_update(install_dir: Path, config: dict[str, Any], session: requests.
             transition("DOWNLOADING")
             raise ValueError("Release requires a newer updater")
         transition("DOWNLOADING")
-        download_release(session, release["downloadUrl"], archive, int(release["sizeBytes"]), str(release_host))
+        download_release(
+            session,
+            config,
+            current_version,
+            release["downloadUrl"],
+            archive,
+            int(release["sizeBytes"]),
+            str(release_host),
+        )
         transition("VERIFYING")
         if sha256_file(archive) != release["sha256"]:
             raise ValueError("Release SHA-256 does not match manifest")
