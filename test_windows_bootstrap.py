@@ -43,9 +43,13 @@ class WindowsBootstrapTests(unittest.TestCase):
     def test_upgrade_reuses_config_without_token_endpoint(self) -> None:
         installer = (ROOT / "install-windows.ps1").read_text(encoding="utf-8")
         upgrade_block = installer.split("if ($Upgrade) {", 1)[1]
+        self.assertIn("$existingConfig.pc_code", upgrade_block)
         self.assertIn("$existingConfig.agent_token", upgrade_block)
         self.assertIn("Existing identity and token preserved unchanged", installer)
-        self.assertIn('if ($configuredApiUrl -notmatch \'^https://\')', installer)
+        self.assertIn('if ($BaseUrl -notmatch \'^https://\')', installer)
+        self.assertIn('Write-Info "Migrating existing base_url ($configuredApiUrl) to HTTPS ($expectedApiUrl)"', installer)
+        self.assertIn('base_url = "$BaseUrl/api/v1/pcs"', installer)
+        self.assertNotIn("Refusing to reuse credentials over a non-HTTPS endpoint", installer)
         self.assertIn('$runtimePipExit = $LASTEXITCODE', installer)
         self.assertIn('$updaterPipExit = $LASTEXITCODE', installer)
         self.assertIn('$taskStatus.State -ne "Running"', installer)

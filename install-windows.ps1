@@ -153,6 +153,9 @@ $programDataConfigPath = Join-Path $programDataConfigDir "config.json"
 
 $existingConfig = $null
 if ($Upgrade) {
+    if ($BaseUrl -notmatch '^https://') {
+        Stop-WithUsage "Upgrade requires an HTTPS BaseUrl."
+    }
     $existingConfigPath = Join-Path $InstallDir "config.json"
     if (-not (Test-Path -LiteralPath $existingConfigPath -PathType Leaf)) {
         if (Test-Path -LiteralPath $programDataConfigPath -PathType Leaf) {
@@ -166,18 +169,15 @@ if ($Upgrade) {
     } catch {
         Stop-WithUsage ("Existing config is invalid JSON: " + $_.Exception.Message)
     }
-    foreach ($requiredProperty in @("pc_code", "agent_token", "base_url")) {
+    foreach ($requiredProperty in @("pc_code", "agent_token")) {
         if ([string]::IsNullOrWhiteSpace([string]$existingConfig.$requiredProperty)) {
             Stop-WithUsage "Existing config is missing required property '$requiredProperty'."
         }
     }
     $configuredApiUrl = [string]$existingConfig.base_url
-    if ($configuredApiUrl -notmatch '^https://') {
-        Stop-WithUsage "Upgrade requires an existing HTTPS base_url. Refusing to reuse credentials over a non-HTTPS endpoint."
-    }
     $expectedApiUrl = "$BaseUrl/api/v1/pcs"
-    if ($configuredApiUrl.TrimEnd("/") -ne $expectedApiUrl.TrimEnd("/")) {
-        Stop-WithUsage "Existing base_url does not match -BaseUrl. Use the backend already stored in config.json."
+    if (($configuredApiUrl -notmatch '^https://') -or ($configuredApiUrl.TrimEnd("/") -ne $expectedApiUrl.TrimEnd("/"))) {
+        Write-Info "Migrating existing base_url ($configuredApiUrl) to HTTPS ($expectedApiUrl)"
     }
 }
 
@@ -664,11 +664,18 @@ if (-not (Test-Path -LiteralPath $programDataConfigDir)) {
 }
 if ($Upgrade) {
     Write-Step "Preserve existing config.json"
-    if (-not (Test-Path -LiteralPath $configPath -PathType Leaf) -and (Test-Path -LiteralPath $programDataConfigPath -PathType Leaf)) {
-        Copy-Item -LiteralPath $programDataConfigPath -Destination $configPath -Force
-    } elseif ((Test-Path -LiteralPath $configPath -PathType Leaf) -and -not (Test-Path -LiteralPath $programDataConfigPath -PathType Leaf)) {
-        Copy-Item -LiteralPath $configPath -Destination $programDataConfigPath -Force
+    $heartbeatInterval = if ($null -ne $existingConfig.heartbeat_interval -and [int]$existingConfig.heartbeat_interval -gt 0) { [int]$existingConfig.heartbeat_interval } else { 60 }
+    $commandPollInterval = if ($null -ne $existingConfig.command_poll_interval -and [int]$existingConfig.command_poll_interval -gt 0) { [int]$existingConfig.command_poll_interval } else { 30 }
+    $config = @{
+        pc_code = [string]$existingConfig.pc_code
+        agent_token = [string]$existingConfig.agent_token
+        base_url = "$BaseUrl/api/v1/pcs"
+        heartbeat_interval = $heartbeatInterval
+        command_poll_interval = $commandPollInterval
     }
+    $configJson = $config | ConvertTo-Json -Depth 5
+    [System.IO.File]::WriteAllText($configPath, $configJson, $utf8NoBom)
+    [System.IO.File]::WriteAllText($programDataConfigPath, $configJson, $utf8NoBom)
     Write-Ok "Existing identity and token preserved unchanged"
 } else {
     Write-Step "Write config.json"
