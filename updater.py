@@ -242,19 +242,23 @@ def start_agent() -> None:
 def install_dependencies(staging_dir: Path) -> None:
     req_file = staging_dir / "requirements.txt"
     if not req_file.exists():
-        return
-    try:
-        res = subprocess.run(
-            [sys.executable, "-m", "pip", "install", "--quiet", "-r", str(req_file)],
-            text=True,
-            capture_output=True,
-            timeout=120,
-            check=False,
-        )
-        if res.returncode != 0:
-            print(f"Warning: pip install returned {res.returncode}: {res.stderr.strip()}", file=sys.stderr)
-    except Exception as exc:
-        print(f"Warning: failed to install dependencies: {exc}", file=sys.stderr)
+        raise ValueError("Release requirements.txt is missing")
+
+    subprocess.run(
+        [sys.executable, "-m", "venv", str(staging_dir / ".venv")],
+        text=True,
+        capture_output=True,
+        timeout=120,
+        check=True,
+    )
+    runtime_python = staging_dir / ".venv" / ("Scripts/python.exe" if platform.system() == "Windows" else "bin/python")
+    subprocess.run(
+        [str(runtime_python), "-m", "pip", "install", "--quiet", "-r", str(req_file)],
+        text=True,
+        capture_output=True,
+        timeout=120,
+        check=True,
+    )
 
 
 def atomic_install(install_dir: Path, staged: Path) -> None:

@@ -183,25 +183,43 @@ class UpdaterTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             updater.require_https("https://evil.example/release.zip", "lab-ilkom.my.id")
 
-    def test_install_dependencies_pip_and_non_fatal_warning(self):
+    def test_install_dependencies_builds_staged_runtime_venv(self):
         with tempfile.TemporaryDirectory() as tmp:
             staging = Path(tmp)
             req = staging / "requirements.txt"
             req.write_text("psutil>=5.9.8\n")
-            with mock.patch("updater.subprocess.run") as mock_run:
+            with mock.patch("updater.platform.system", return_value="Windows"), \
+                 mock.patch("updater.subprocess.run") as mock_run:
                 mock_run.return_value = subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
                 updater.install_dependencies(staging)
-                mock_run.assert_called_once_with(
-                    [sys.executable, "-m", "pip", "install", "--quiet", "-r", str(req)],
-                    text=True,
-                    capture_output=True,
-                    timeout=120,
-                    check=False,
-                )
 
-            with mock.patch("updater.subprocess.run", side_effect=subprocess.TimeoutExpired(cmd="pip", timeout=120)):
-                # Should not raise on failure/timeout
-                updater.install_dependencies(staging)
+            self.assertEqual(
+                mock_run.call_args_list,
+                [
+                    mock.call(
+                        [sys.executable, "-m", "venv", str(staging / ".venv")],
+                        text=True,
+                        capture_output=True,
+                        timeout=120,
+                        check=True,
+                    ),
+                    mock.call(
+                        [str(staging / ".venv" / "Scripts/python.exe"), "-m", "pip", "install", "--quiet", "-r", str(req)],
+                        text=True,
+                        capture_output=True,
+                        timeout=120,
+                        check=True,
+                    ),
+                ],
+            )
+
+    def test_install_dependencies_failure_aborts_update(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            staging = Path(tmp)
+            (staging / "requirements.txt").write_text("psutil>=5.9.8\n")
+            with mock.patch("updater.subprocess.run", side_effect=subprocess.CalledProcessError(1, "venv")):
+                with self.assertRaises(subprocess.CalledProcessError):
+                    updater.install_dependencies(staging)
 
 
 class AgentLoopTests(unittest.TestCase):
@@ -337,8 +355,8 @@ class WindowsInteractiveCaptureTests(unittest.TestCase):
 
 
 class AgentMaintenanceCommandTests(unittest.TestCase):
-    def test_version_is_1_2_2(self):
-        self.assertEqual(agent.AGENT_VERSION, "1.2.2")
+    def test_version_is_1_2_3(self):
+        self.assertEqual(agent.AGENT_VERSION, "1.2.3")
 
     def test_list_processes(self):
         fake_proc = mock.MagicMock()
