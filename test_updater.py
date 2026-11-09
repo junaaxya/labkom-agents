@@ -491,6 +491,7 @@ class AgentMaintenanceCommandTests(unittest.TestCase):
         fake_cv2.imencode.return_value = (True, fake_encoded)
 
         with mock.patch.dict(sys.modules, {"cv2": fake_cv2}), \
+             mock.patch("agent.shutil.which", return_value="/usr/bin/notify-send"), \
              mock.patch("agent.subprocess.Popen") as mock_popen:
             ok, result = agent.execute_command({"command": "CAPTURE_WEBCAM", "payload": {"silent": True}})
             self.assertTrue(ok)
