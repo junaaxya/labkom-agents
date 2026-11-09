@@ -7,6 +7,8 @@ import os
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
 import zipfile
 from pathlib import Path
@@ -128,6 +130,48 @@ class UpdaterTests(unittest.TestCase):
             with mock.patch("updater.subprocess.run", side_effect=subprocess.TimeoutExpired(cmd="pip", timeout=120)):
                 # Should not raise on failure/timeout
                 updater.install_dependencies(staging)
+
+
+class AgentLoopTests(unittest.TestCase):
+    def test_slow_command_does_not_block_or_duplicate_heartbeat(self):
+        config = {"heartbeat_interval": 1, "command_poll_interval": 5}
+        stop_event = threading.Event()
+        command_started = threading.Event()
+        release_command = threading.Event()
+        heartbeat_times = []
+        poll_count = 0
+
+        def fake_heartbeat(_config):
+            heartbeat_times.append(time.monotonic())
+            if len(heartbeat_times) == 2:
+                stop_event.set()
+                release_command.set()
+            return True
+
+        def fake_poll(_config):
+            nonlocal poll_count
+            poll_count += 1
+            return [{"id": "slow", "command": "CAPTURE_SCREEN"}] if poll_count == 1 else []
+
+        def fake_execute(_cmd):
+            command_started.set()
+            release_command.wait(3)
+            return True, "done"
+
+        with mock.patch("agent.send_heartbeat", side_effect=fake_heartbeat), \
+             mock.patch("agent.poll_commands", side_effect=fake_poll), \
+             mock.patch("agent.execute_command", side_effect=fake_execute), \
+             mock.patch("agent.report_result"), \
+             mock.patch("agent.send_log"):
+            runner = threading.Thread(target=agent.run_agent, args=(config, stop_event))
+            runner.start()
+            self.assertTrue(command_started.wait(1))
+            runner.join(3)
+
+        self.assertFalse(runner.is_alive())
+        self.assertEqual(len(heartbeat_times), 2)
+        self.assertGreaterEqual(heartbeat_times[1] - heartbeat_times[0], 0.8)
+        self.assertEqual(poll_count, 1)
 
 
 class AgentMaintenanceCommandTests(unittest.TestCase):

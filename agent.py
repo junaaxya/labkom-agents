@@ -13,6 +13,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.parse
 import webbrowser
@@ -480,8 +481,24 @@ def notify_lab_inspection(kind: str, payload: dict) -> None:
         pass
 
 
+def is_windows_session_zero() -> bool:
+    if platform.system() != "Windows":
+        return False
+    try:
+        import ctypes
+        session_id = ctypes.c_ulong()
+        found = ctypes.windll.kernel32.ProcessIdToSessionId(
+            os.getpid(), ctypes.byref(session_id)
+        )
+        return bool(found) and session_id.value == 0
+    except Exception:
+        return False
+
+
 def capture_screen_diagnostic(payload: dict) -> tuple[bool, str]:
     notify_lab_inspection("CAPTURE_SCREEN", payload)
+    if is_windows_session_zero():
+        return False, "Screen capture unavailable from Windows SYSTEM Session 0"
     try:
         from PIL import Image, ImageGrab
     except ImportError as exc:
@@ -518,6 +535,8 @@ def capture_screen_diagnostic(payload: dict) -> tuple[bool, str]:
 
 def capture_webcam_diagnostic(payload: dict) -> tuple[bool, str]:
     notify_lab_inspection("CAPTURE_WEBCAM", payload)
+    if is_windows_session_zero():
+        return False, "Webcam capture unavailable from Windows SYSTEM Session 0"
     try:
         import cv2
     except ImportError as exc:
@@ -632,29 +651,30 @@ def send_log(config: dict, event_type: str, level: str, message: str):
         pass
 
 
-def main():
-    config = load_config()
-    logger.info("LabKom Agent starting for PC: %s", config["pc_code"])
-
-    if not register(config):
-        logger.warning("Registration failed, will retry on next heartbeat")
-
-    send_log(config, "AGENT_STARTED", "INFO", f"Agent started on {platform.node()}")
-
-    heartbeat_interval = config.get("heartbeat_interval", 60)
-    command_interval = min(int(config.get("command_poll_interval", 5)), 5)
-
-    last_heartbeat = 0
-    last_command_poll = 0
-
-    while True:
-        now = time.time()
-
-        if now - last_heartbeat >= heartbeat_interval:
+def heartbeat_loop(config: dict, stop_event: threading.Event) -> None:
+    # Keep three heartbeat opportunities inside the backend's 90-second offline window.
+    interval = min(30, max(1, int(config.get("heartbeat_interval", 30))))
+    while not stop_event.is_set():
+        started = time.monotonic()
+        try:
             send_heartbeat(config)
-            last_heartbeat = now
+        except Exception:
+            logger.exception("Unexpected heartbeat error")
+        stop_event.wait(max(0, interval - (time.monotonic() - started)))
 
-        if now - last_command_poll >= command_interval:
+
+def run_agent(config: dict, stop_event: threading.Event) -> None:
+    heartbeat_thread = threading.Thread(
+        target=heartbeat_loop,
+        args=(config, stop_event),
+        name="heartbeat",
+        daemon=True,
+    )
+    heartbeat_thread.start()
+    command_interval = max(5, int(config.get("command_poll_interval", 5)))
+
+    try:
+        while not stop_event.is_set():
             commands = poll_commands(config)
             for cmd in commands:
                 success, result = execute_command(cmd)
@@ -665,9 +685,21 @@ def main():
                     "INFO" if success else "ERROR",
                     f"{cmd.get('command')}: {result}",
                 )
-            last_command_poll = now
+            stop_event.wait(command_interval)
+    finally:
+        stop_event.set()
+        heartbeat_thread.join(timeout=15)
 
-        time.sleep(1)
+
+def main():
+    config = load_config()
+    logger.info("LabKom Agent starting for PC: %s", config["pc_code"])
+
+    if not register(config):
+        logger.warning("Registration failed, will retry on next heartbeat")
+
+    send_log(config, "AGENT_STARTED", "INFO", f"Agent started on {platform.node()}")
+    run_agent(config, threading.Event())
 
 
 if __name__ == "__main__":
