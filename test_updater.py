@@ -247,8 +247,8 @@ class AgentLoopTests(unittest.TestCase):
 
 
 class AgentMaintenanceCommandTests(unittest.TestCase):
-    def test_version_is_1_2_1(self):
-        self.assertEqual(agent.AGENT_VERSION, "1.2.1")
+    def test_version_is_1_2_2(self):
+        self.assertEqual(agent.AGENT_VERSION, "1.2.2")
 
     def test_list_processes(self):
         fake_proc = mock.MagicMock()
