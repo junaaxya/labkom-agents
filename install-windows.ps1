@@ -445,7 +445,8 @@ if (-not (Test-Path $updaterSource)) {
     Write-Err "Missing updater.py next to install-windows.ps1"
     exit 1
 }
-Copy-Item $updaterSource $InstallDir -Force
+# Copy updater only after stopping its scheduled task; its stable venv can prepare
+# the staged runtime without replacing a file that an updater process may be using.
 
 if ([string]::IsNullOrWhiteSpace($ReleasePublicKeyPath)) {
     $ReleasePublicKeyPath = Join-Path $scriptDir "release-public-key.pem"
@@ -590,15 +591,33 @@ $python = $pythonPath
 Push-Location $InstallDir
 $runtimeVenv = Join-Path $currentDir ".venv"
 $updaterVenv = Join-Path $InstallDir "updater-venv"
-& $python -m venv $runtimeVenv
-& $python -m venv $updaterVenv
 $runtimePython = Join-Path $runtimeVenv "Scripts\python.exe"
 $updaterPython = Join-Path $updaterVenv "Scripts\python.exe"
+& $python -m venv $runtimeVenv
+$installUpdaterDependencies = -not (Test-Path -LiteralPath $updaterPython -PathType Leaf)
+if ($installUpdaterDependencies) {
+    & $python -m venv $updaterVenv
+} else {
+    Write-Info "Reusing stable updater-venv; active virtual environments are never copied or rebuilt"
+}
 & $runtimePython -m pip install -r (Join-Path $currentDir "requirements.txt")
 $runtimePipExit = $LASTEXITCODE
 if ($runtimePipExit -eq 0) {
-    & $updaterPython -m pip install -r (Join-Path $currentDir "requirements.txt")
-    $updaterPipExit = $LASTEXITCODE
+    if (-not $installUpdaterDependencies) {
+        & $updaterPython -c "import requests; import cryptography"
+        if ($LASTEXITCODE -ne 0) {
+            Write-Info "Existing updater-venv is unusable; rebuilding before updater task is stopped"
+            Remove-Item -LiteralPath $updaterVenv -Recurse -Force
+            & $python -m venv $updaterVenv
+            $installUpdaterDependencies = $true
+        }
+    }
+    if ($installUpdaterDependencies) {
+        & $updaterPython -m pip install -r (Join-Path $currentDir "requirements.txt")
+        $updaterPipExit = $LASTEXITCODE
+    } else {
+        $updaterPipExit = 0
+    }
 } else {
     $updaterPipExit = 0
 }
@@ -620,6 +639,7 @@ if ($existingUpdaterTask.ExitCode -eq 0) {
     Invoke-Schtasks -Arguments @("/end", "/tn", $existingUpdaterTaskName) -AllowFailure | Out-Null
     Write-Ok "Existing updater task stopped"
 }
+Copy-Item $updaterSource (Join-Path $InstallDir "updater.py") -Force
 $existingTask = Invoke-Schtasks -Arguments @("/query", "/tn", $existingTaskName) -AllowFailure
 if ($existingTask.ExitCode -eq 0) {
     Invoke-Schtasks -Arguments @("/end", "/tn", $existingTaskName) -AllowFailure | Out-Null

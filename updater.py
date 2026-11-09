@@ -24,7 +24,7 @@ from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
-UPDATER_VERSION = "1.0.0"
+UPDATER_VERSION = "1.0.1"
 ALLOWED_FILES = {"agent.py", "requirements.txt", "updater.py", "VERSION"}
 MAX_ARTIFACT_BYTES = 20 * 1024 * 1024
 MAX_EXTRACTED_BYTES = 50 * 1024 * 1024
@@ -261,6 +261,17 @@ def install_dependencies(staging_dir: Path) -> None:
     )
 
 
+def install_updated_updater(install_dir: Path) -> None:
+    source = install_dir / "current" / "updater.py"
+    destination = install_dir / "updater.py"
+    pending = install_dir / "updater.py.new"
+    try:
+        shutil.copy2(source, pending)
+        os.replace(pending, destination)
+    finally:
+        pending.unlink(missing_ok=True)
+
+
 def atomic_install(install_dir: Path, staged: Path) -> None:
     current = install_dir / "current"
     previous = install_dir / "previous"
@@ -390,7 +401,7 @@ def perform_update(install_dir: Path, config: dict[str, Any], session: requests.
         agent_stopped = False
         transition("AWAITING_HEARTBEAT")
         if wait_for_confirmation(session, config, target, attempt_id, int(config.get("update_confirmation_timeout", 120))):
-            shutil.copy2(install_dir / "current" / "updater.py", install_dir / "updater.py")
+            install_updated_updater(install_dir)
             return True
 
         transition("ROLLING_BACK", "Target heartbeat was not confirmed before timeout")

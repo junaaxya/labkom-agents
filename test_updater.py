@@ -221,6 +221,146 @@ class UpdaterTests(unittest.TestCase):
                 with self.assertRaises(subprocess.CalledProcessError):
                     updater.install_dependencies(staging)
 
+    def simulate_windows_layout_update(self, heartbeat_confirmed: bool) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            install_dir = Path(tmp)
+            current = install_dir / "current"
+            current.mkdir()
+            old_runtime_python = current / ".venv" / "Scripts" / "python.exe"
+            old_runtime_python.parent.mkdir(parents=True)
+            old_runtime_python.write_text("old runtime python\n")
+            for name, content in {
+                "agent.py": "OLD_AGENT = True\n",
+                "requirements.txt": "requests==2.32.5\n",
+                "updater.py": "OLD_UPDATER = True\n",
+                "VERSION": "1.2.3\n",
+            }.items():
+                (current / name).write_text(content)
+
+            updater_python = install_dir / "updater-venv" / "Scripts" / "python.exe"
+            updater_python.parent.mkdir(parents=True)
+            updater_python.write_text("stable updater python\n")
+            (install_dir / "config.json").write_text('{"pc_code":"PC-LABM-10"}\n')
+            runner_python = install_dir / "current" / ".venv" / "Scripts" / "python.exe"
+            (install_dir / "run-agent.cmd").write_text(
+                f'@echo off\n"{runner_python}" "{install_dir / "current" / "agent.py"}"\n'
+            )
+            (install_dir / "run-updater.cmd").write_text(
+                f'@echo off\n"{updater_python}" "{install_dir / "updater.py"}"\n'
+            )
+            (install_dir / "updater.py").write_text("OLD_UPDATER = True\n")
+
+            private_key = Ed25519PrivateKey.generate()
+            (install_dir / "release-public-key.pem").write_bytes(
+                private_key.public_key().public_bytes(
+                    serialization.Encoding.PEM,
+                    serialization.PublicFormat.SubjectPublicKeyInfo,
+                )
+            )
+            artifact = install_dir / "synthetic-1.2.4.zip"
+            with zipfile.ZipFile(artifact, "w") as bundle:
+                bundle.writestr("agent.py", "NEW_AGENT = True\n")
+                bundle.writestr("requirements.txt", "new-dependency==1.0\n")
+                bundle.writestr("updater.py", "NEW_UPDATER = True\n")
+                bundle.writestr("VERSION", "1.2.4\n")
+            with zipfile.ZipFile(artifact) as bundle:
+                self.assertEqual(set(bundle.namelist()), updater.ALLOWED_FILES)
+                self.assertFalse(any(name.startswith(".venv/") for name in bundle.namelist()))
+
+            release = {
+                "id": "release-1.2.4",
+                "version": "1.2.4",
+                # v1.2.3 reports updater 1.0.0 despite containing the staged-venv fix.
+                "minimumUpdaterVersion": "1.0.0",
+                "downloadUrl": "https://lab-ilkom.my.id/release.zip?pcCode=PC-LABM-10",
+                "sha256": hashlib.sha256(artifact.read_bytes()).hexdigest(),
+                "sizeBytes": artifact.stat().st_size,
+            }
+            release["signature"] = base64.b64encode(
+                private_key.sign(updater.canonical_manifest(release))
+            ).decode("ascii")
+            update = {"updateAvailable": True, "attemptId": "attempt-1.2.4", "release": release}
+            config = {
+                "base_url": "https://lab-ilkom.my.id/api/v1/pcs",
+                "pc_code": "PC-LABM-10",
+                "agent_token": "test-token",
+            }
+            statuses = []
+            started_versions = []
+
+            def fake_download(_session, _config, _version, _url, destination, _size, _host):
+                destination.write_bytes(artifact.read_bytes())
+
+            def fake_subprocess_run(command, **_kwargs):
+                if command[1:3] == ["-m", "venv"]:
+                    self.assertEqual(command[0], str(updater_python), "stable updater Python must build target venv")
+                    runtime_python = Path(command[3]) / "Scripts" / "python.exe"
+                    runtime_python.parent.mkdir(parents=True)
+                    runtime_python.write_text("new runtime python\n")
+                elif command[1:4] == ["-m", "pip", "install"]:
+                    runtime_python = Path(command[0])
+                    self.assertTrue(runtime_python.is_file())
+                    marker = runtime_python.parent.parent / "Lib" / "site-packages" / "new_dependency.installed"
+                    marker.parent.mkdir(parents=True)
+                    marker.write_text("installed\n")
+                return subprocess.CompletedProcess(command, 0, "", "")
+
+            def fake_start_agent():
+                self.assertTrue(runner_python.is_file(), "run-agent.cmd target must exist before task restart")
+                self.assertIn(str(runner_python), (install_dir / "run-agent.cmd").read_text())
+                started_versions.append(updater.load_version(install_dir / "current"))
+
+            with mock.patch("updater.check_update", return_value=update), \
+                 mock.patch("updater.download_release", side_effect=fake_download), \
+                 mock.patch("updater.platform.system", return_value="Windows"), \
+                 mock.patch("updater.sys.executable", str(updater_python)), \
+                 mock.patch("updater.subprocess.run", side_effect=fake_subprocess_run), \
+                 mock.patch("updater.stop_agent"), \
+                 mock.patch("updater.start_agent", side_effect=fake_start_agent), \
+                 mock.patch("updater.wait_for_confirmation", return_value=heartbeat_confirmed), \
+                 mock.patch("updater.report_status", side_effect=lambda *args: statuses.append(args[4])):
+                changed = updater.perform_update(install_dir, config, mock.MagicMock())
+
+            if heartbeat_confirmed:
+                self.assertTrue(changed)
+                self.assertEqual(updater.load_version(install_dir / "current"), "1.2.4")
+                self.assertEqual(started_versions, ["1.2.4"])
+                self.assertTrue(
+                    (install_dir / "current" / ".venv" / "Lib" / "site-packages" / "new_dependency.installed").is_file()
+                )
+                self.assertEqual((install_dir / "updater.py").read_text(), "NEW_UPDATER = True\n")
+                self.assertFalse((install_dir / "updater.py.new").exists())
+                self.assertEqual(updater.load_version(install_dir / "previous"), "1.2.3")
+                self.assertEqual(statuses, ["DOWNLOADING", "VERIFYING", "INSTALLING", "AWAITING_HEARTBEAT"])
+            else:
+                self.assertFalse(changed)
+                self.assertEqual(updater.load_version(install_dir / "current"), "1.2.3")
+                self.assertEqual(started_versions, ["1.2.4", "1.2.3"])
+                self.assertEqual((install_dir / "updater.py").read_text(), "OLD_UPDATER = True\n")
+                self.assertFalse((install_dir / "previous").exists())
+                self.assertEqual(
+                    statuses,
+                    ["DOWNLOADING", "VERIFYING", "INSTALLING", "AWAITING_HEARTBEAT", "ROLLING_BACK", "ROLLED_BACK"],
+                )
+
+    def test_windows_layout_update_to_release_without_venv_succeeds(self):
+        self.simulate_windows_layout_update(heartbeat_confirmed=True)
+
+    def test_windows_layout_update_rolls_back_unconfirmed_runtime(self):
+        self.simulate_windows_layout_update(heartbeat_confirmed=False)
+
+    def test_updater_self_update_preserves_old_file_when_replace_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            install_dir = Path(tmp)
+            (install_dir / "current").mkdir()
+            (install_dir / "current" / "updater.py").write_text("new\n")
+            (install_dir / "updater.py").write_text("old\n")
+            with mock.patch("updater.os.replace", side_effect=PermissionError("locked")):
+                with self.assertRaises(PermissionError):
+                    updater.install_updated_updater(install_dir)
+            self.assertEqual((install_dir / "updater.py").read_text(), "old\n")
+            self.assertFalse((install_dir / "updater.py.new").exists())
+
 
 class AgentLoopTests(unittest.TestCase):
     def test_command_exception_is_reported_without_stopping_agent(self):
@@ -355,8 +495,8 @@ class WindowsInteractiveCaptureTests(unittest.TestCase):
 
 
 class AgentMaintenanceCommandTests(unittest.TestCase):
-    def test_version_is_1_2_3(self):
-        self.assertEqual(agent.AGENT_VERSION, "1.2.3")
+    def test_version_is_1_2_4(self):
+        self.assertEqual(agent.AGENT_VERSION, "1.2.4")
 
     def test_list_processes(self):
         fake_proc = mock.MagicMock()

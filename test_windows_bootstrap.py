@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import subprocess
 import sys
 import tempfile
@@ -52,12 +53,18 @@ class WindowsBootstrapTests(unittest.TestCase):
         self.assertNotIn("Refusing to reuse credentials over a non-HTTPS endpoint", installer)
         self.assertIn('$runtimePipExit = $LASTEXITCODE', installer)
         self.assertIn('$updaterPipExit = $LASTEXITCODE', installer)
+        self.assertIn('$installUpdaterDependencies = -not (Test-Path -LiteralPath $updaterPython -PathType Leaf)', installer)
+        self.assertIn('Reusing stable updater-venv; active virtual environments are never copied or rebuilt', installer)
+        self.assertIn('Existing updater-venv is unusable; rebuilding before updater task is stopped', installer)
+        self.assertLess(installer.index('Remove-Item -LiteralPath $updaterVenv -Recurse -Force'), installer.index('Write-Step "Stopping existing LabKom Agent if present"'))
+        self.assertNotIn('Copy-Item $updaterVenv', installer)
         self.assertIn('$taskStatus.State -ne "Running"', installer)
         self.assertIn('$agentTask.Settings.RestartCount = 3', installer)
         self.assertIn('$agentTask.Settings.RestartInterval = "PT1M"', installer)
         self.assertIn("Provisioning Token", installer)
         self.assertIn("C:\\ProgramData\\LabKom Agent", installer)
         self.assertLess(installer.index('Write-Ok "Dependencies installed"'), installer.index('Write-Step "Stopping existing LabKom Agent if present"'))
+        self.assertLess(installer.index('Invoke-Schtasks -Arguments @("/end", "/tn", $existingUpdaterTaskName)'), installer.index('Copy-Item $updaterSource (Join-Path $InstallDir "updater.py") -Force'))
         self.assertNotIn("generate-token", upgrade_block.split("} else {", 1)[0])
 
     def test_builder_outputs_minimal_zip_and_checksum(self) -> None:
@@ -90,6 +97,7 @@ class WindowsBootstrapTests(unittest.TestCase):
             with zipfile.ZipFile(archive) as package:
                 self.assertEqual(set(package.namelist()), EXPECTED)
                 self.assertEqual(package.read("release-public-key.pem"), public_key_path.read_bytes())
+                self.assertIn(b'UPDATER_VERSION = "1.0.1"', package.read("updater.py"))
             self.assertTrue(checksum.read_text(encoding="ascii").endswith(f"  {archive.name}\n"))
 
     def test_release_workflow_and_cli_builder_contract(self) -> None:
@@ -105,6 +113,7 @@ class WindowsBootstrapTests(unittest.TestCase):
         self.assertIn('gh release create "v$VERSION"', workflow)
         self.assertIn("/api/v1/pcs/agent-updates/releases/ci", workflow)
         self.assertIn("X-Agent-CI-Token: $LABKOM_CI_RELEASE_TOKEN", workflow)
+        self.assertIn('-F "minimumUpdaterVersion=1.0.0"', workflow)
 
         with tempfile.TemporaryDirectory() as temp:
             out_zip = Path(temp) / "labkom-agent-1.1.0.zip"
@@ -124,6 +133,34 @@ class WindowsBootstrapTests(unittest.TestCase):
             self.assertTrue(out_zip.is_file())
             with zipfile.ZipFile(out_zip) as archive:
                 self.assertEqual(set(archive.namelist()), {"agent.py", "requirements.txt", "updater.py", "VERSION"})
+
+            private_key = Ed25519PrivateKey.generate()
+            private_key_path = Path(temp) / "private.pem"
+            private_key_path.write_bytes(
+                private_key.private_bytes(
+                    serialization.Encoding.PEM,
+                    serialization.PrivateFormat.PKCS8,
+                    serialization.NoEncryption(),
+                )
+            )
+            signed_out = Path(temp) / "signed"
+            subprocess.run(
+                [
+                    sys.executable,
+                    str(ROOT / "build-release.py"),
+                    "--private-key",
+                    str(private_key_path),
+                    "--version",
+                    "1.1.0",
+                    "--out",
+                    str(signed_out),
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            manifest = json.loads((signed_out / "1.1.0" / "manifest.json").read_text())
+            self.assertEqual(manifest["minimumUpdaterVersion"], "1.0.0")
 
 
 if __name__ == "__main__":
