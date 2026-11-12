@@ -606,8 +606,8 @@ class WindowsInteractiveCommandTests(unittest.TestCase):
 
 
 class AgentMaintenanceCommandTests(unittest.TestCase):
-    def test_version_is_1_2_4_without_release_bump(self):
-        self.assertEqual(agent.AGENT_VERSION, "1.2.4")
+    def test_version_is_1_2_5(self):
+        self.assertEqual(agent.AGENT_VERSION, "1.2.5")
 
     def test_v1_0_0_has_no_interactive_capability_contract(self):
         legacy_source = subprocess.run(
