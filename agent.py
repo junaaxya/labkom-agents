@@ -31,12 +31,25 @@ PROGRAM_DATA_CONFIG_PATH = Path(os.environ.get("ProgramData", r"C:\ProgramData")
 VERSION_PATH = RUNTIME_DIR / "VERSION"
 AGENT_VERSION = VERSION_PATH.read_text(encoding="ascii").strip() if VERSION_PATH.exists() else "1.0.0"
 INTERACTIVE_COMMANDS = ("CAPTURE_SCREEN", "CAPTURE_WEBCAM", "OPEN_URL")
-AGENT_CAPABILITIES = (
-    "INTERACTIVE_SCREEN_CAPTURE",
-    "INTERACTIVE_WEBCAM_CAPTURE",
-    "INTERACTIVE_OPEN_URL",
-)
 INTERACTIVE_TASK_NAME = "LabKom Agent Interactive Capture"
+
+
+def capabilities_for_version(version: str) -> tuple[str, ...]:
+    try:
+        parts = tuple(int(part) for part in version.split("."))
+        if len(parts) != 3:
+            return ()
+    except ValueError:
+        return ()
+    capabilities = []
+    if parts >= (1, 2, 3):
+        capabilities.extend(("INTERACTIVE_SCREEN_CAPTURE", "INTERACTIVE_WEBCAM_CAPTURE"))
+    if parts >= (1, 2, 5):
+        capabilities.append("INTERACTIVE_OPEN_URL")
+    return tuple(capabilities)
+
+
+AGENT_CAPABILITIES = capabilities_for_version(AGENT_VERSION)
 INTERACTIVE_MODE = "--interactive-helper" in sys.argv or "--interactive-capture" in sys.argv
 LOG_DIR = INSTALL_DIR / ("interactive-capture" if INTERACTIVE_MODE else "logs")
 LOG_DIR.mkdir(exist_ok=True)

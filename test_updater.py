@@ -609,17 +609,15 @@ class AgentMaintenanceCommandTests(unittest.TestCase):
     def test_version_is_1_2_5(self):
         self.assertEqual(agent.AGENT_VERSION, "1.2.5")
 
-    def test_v1_0_0_has_no_interactive_capability_contract(self):
-        legacy_source = subprocess.run(
-            ["git", "show", "6dd3d7e:agent.py"],
-            cwd=Path(__file__).resolve().parent,
-            capture_output=True,
-            text=True,
-            check=True,
-        ).stdout
-        self.assertNotIn("CAPTURE_SCREEN", legacy_source)
-        self.assertNotIn("CAPTURE_WEBCAM", legacy_source)
-        self.assertNotIn("agentCapabilities", legacy_source)
+    def test_capability_contract_by_version(self):
+        self.assertEqual(agent.capabilities_for_version("1.0.0"), ())
+        self.assertEqual(
+            agent.capabilities_for_version("1.2.4"),
+            ("INTERACTIVE_SCREEN_CAPTURE", "INTERACTIVE_WEBCAM_CAPTURE"),
+        )
+        self.assertEqual(agent.capabilities_for_version("1.2.5"), agent.AGENT_CAPABILITIES)
+        self.assertIn("INTERACTIVE_OPEN_URL", agent.AGENT_CAPABILITIES)
+        self.assertEqual(agent.capabilities_for_version("invalid"), ())
 
     def test_list_processes(self):
         fake_proc = mock.MagicMock()
