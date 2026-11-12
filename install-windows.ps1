@@ -741,6 +741,7 @@ $agentTask.Settings.RestartInterval = "PT1M"
 $agentTask.Settings.ExecutionTimeLimit = "PT0S"
 Set-ScheduledTask -InputObject $agentTask | Out-Null
 Write-Ok "Scheduled task created (SYSTEM at boot, restart on failure)"
+Write-Info "Interactive task is registered/refreshed on demand by the running SYSTEM agent for the exact active user session"
 
 # Updater is separate so it can restore previous runtime when the new agent fails.
 $updaterTaskName = "LabKom Agent Updater"

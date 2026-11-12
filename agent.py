@@ -30,7 +30,15 @@ CONFIG_PATH = INSTALL_DIR / "config.json"
 PROGRAM_DATA_CONFIG_PATH = Path(os.environ.get("ProgramData", r"C:\ProgramData")) / "LabKom Agent" / "config.json"
 VERSION_PATH = RUNTIME_DIR / "VERSION"
 AGENT_VERSION = VERSION_PATH.read_text(encoding="ascii").strip() if VERSION_PATH.exists() else "1.0.0"
-LOG_DIR = INSTALL_DIR / ("interactive-capture" if "--interactive-capture" in sys.argv else "logs")
+INTERACTIVE_COMMANDS = ("CAPTURE_SCREEN", "CAPTURE_WEBCAM", "OPEN_URL")
+AGENT_CAPABILITIES = (
+    "INTERACTIVE_SCREEN_CAPTURE",
+    "INTERACTIVE_WEBCAM_CAPTURE",
+    "INTERACTIVE_OPEN_URL",
+)
+INTERACTIVE_TASK_NAME = "LabKom Agent Interactive Capture"
+INTERACTIVE_MODE = "--interactive-helper" in sys.argv or "--interactive-capture" in sys.argv
+LOG_DIR = INSTALL_DIR / ("interactive-capture" if INTERACTIVE_MODE else "logs")
 LOG_DIR.mkdir(exist_ok=True)
 
 logging.basicConfig(
@@ -128,6 +136,7 @@ def get_system_info() -> dict:
         "ipAddress": get_local_ip(),
         "macAddress": get_mac_address(),
         "agentVersion": AGENT_VERSION,
+        "agentCapabilities": list(AGENT_CAPABILITIES),
     }
 
 
@@ -163,6 +172,7 @@ def get_metrics() -> dict:
         "architecture": platform.machine(),
         "cpuModel": platform.processor() or "Unknown",
         "agentVersion": AGENT_VERSION,
+        "agentCapabilities": list(AGENT_CAPABILITIES),
     }
 
 
@@ -402,22 +412,46 @@ def kill_target_process(payload: dict) -> tuple[bool, str]:
         return False, f"Failed to terminate PID {pid}: {exc}"
 
 
-def open_target_url(payload: dict) -> tuple[bool, str]:
-    url = str(payload.get("url") or "").strip()
-    parsed = urllib.parse.urlparse(url)
-    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-        return False, "Invalid URL: only http:// and https:// are allowed"
+def validate_http_url(value: object) -> str:
+    url = str(value or "").strip()
+    if not url or len(url) > 2048 or "\\" in url or any(char.isspace() or ord(char) < 32 or ord(char) == 127 for char in url):
+        raise ValueError("Invalid URL: only a bounded http:// or https:// URL is allowed")
+    parsed = urllib.parse.urlsplit(url)
+    if parsed.scheme.lower() not in {"http", "https"} or not parsed.netloc or not parsed.hostname:
+        raise ValueError("Invalid URL: only http:// and https:// are allowed")
+    if parsed.username is not None or parsed.password is not None:
+        raise ValueError("Invalid URL: embedded credentials are not allowed")
+    try:
+        parsed.port
+    except ValueError as exc:
+        raise ValueError("Invalid URL: port is not valid") from exc
+    return url
 
+
+def open_target_url(payload: dict) -> tuple[bool, str]:
+    try:
+        url = validate_http_url(payload.get("url"))
+    except ValueError as exc:
+        return False, str(exc)
+
+    if is_windows_session_zero():
+        return run_windows_interactive_command("OPEN_URL", {"url": url})
+
+    if platform.system() == "Windows" and not INTERACTIVE_MODE:
+        return False, "Interactive OPEN_URL requires the SYSTEM agent task and an active unlocked user session"
+    notified, detail = notify_lab_inspection("OPEN_URL")
+    if not notified:
+        return False, detail
     try:
         if platform.system() == "Windows":
-            subprocess.Popen(["cmd", "/c", "start", "", url])
+            os.startfile(url)  # type: ignore[attr-defined]
         else:
             xdg_open = shutil.which("xdg-open")
             if xdg_open:
                 subprocess.Popen([xdg_open, url])
-            else:
-                webbrowser.open(url)
-        return True, f"Opened URL: {url}"
+            elif not webbrowser.open(url):
+                return False, "Failed to open URL: no desktop URL handler is available"
+        return True, f"Opened URL visibly in active user session: {url}"
     except Exception as exc:
         return False, f"Failed to open URL: {exc}"
 
@@ -467,32 +501,49 @@ def clean_temp_files() -> tuple[bool, str]:
     return True, f"Cleaned {removed_files} temp items ({freed_mb} MB freed)"
 
 
-def notify_lab_inspection(kind: str, payload: dict) -> None:
-    notice = f"Koordinator Lab sedang melakukan pemeriksaan praktikum/ujian ({kind})"
+def notify_lab_inspection(kind: str) -> tuple[bool, str]:
+    notice = f"Koordinator Lab sedang melakukan tindakan transparan ({kind})"
     logger.info(notice)
     try:
         if platform.system() == "Windows":
-            subprocess.Popen(["msg.exe", "*", notice])
+            session_id = get_current_windows_session_id()
+            if session_id is None or session_id == 0:
+                return False, "Visible user notification failed: helper is not in an interactive user session"
+            notified = subprocess.run(
+                ["msg.exe", str(session_id), "/TIME:15", notice],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+            if notified.returncode != 0:
+                detail = (notified.stderr or notified.stdout).strip()
+                return False, f"Visible user notification failed: {detail or notified.returncode}"
         else:
             notify_bin = shutil.which("notify-send")
-            if notify_bin:
-                subprocess.Popen([notify_bin, "LabKom Exam Monitor", notice])
+            if not notify_bin:
+                return False, "Visible user notification failed: notify-send is unavailable"
+            subprocess.Popen([notify_bin, "LabKom Exam Monitor", notice])
+        return True, notice
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return False, f"Visible user notification failed: {exc}"
+
+
+def get_current_windows_session_id() -> Optional[int]:
+    if platform.system() != "Windows":
+        return None
+    try:
+        import ctypes
+
+        session_id = ctypes.c_ulong()
+        found = ctypes.windll.kernel32.ProcessIdToSessionId(os.getpid(), ctypes.byref(session_id))
+        return int(session_id.value) if found else None
     except Exception:
-        pass
+        return None
 
 
 def is_windows_session_zero() -> bool:
-    if platform.system() != "Windows":
-        return False
-    try:
-        import ctypes
-        session_id = ctypes.c_ulong()
-        found = ctypes.windll.kernel32.ProcessIdToSessionId(
-            os.getpid(), ctypes.byref(session_id)
-        )
-        return bool(found) and session_id.value == 0
-    except Exception:
-        return False
+    return get_current_windows_session_id() == 0
 
 
 def ensure_windows_agent_task_resilience() -> None:
@@ -521,40 +572,36 @@ def ensure_windows_interactive_capture_task() -> bool:
     if platform.system() != "Windows" or not is_windows_session_zero():
         return False
     capture_dir = INSTALL_DIR / "interactive-capture"
-    runner_path = INSTALL_DIR / "run-interactive-capture.cmd"
     try:
-        capture_dir.mkdir(exist_ok=True)
-        runner_path.write_text(
-            f'@echo off\r\n"{sys.executable}" "{RUNTIME_DIR / "agent.py"}" --interactive-capture\r\n',
-            encoding="utf-8",
-        )
-        acl = subprocess.run(
-            ["icacls", str(capture_dir), "/grant", "*S-1-5-4:(OI)(CI)M"],
-            capture_output=True,
-            text=True,
-            timeout=10,
-            check=False,
-        )
-        if acl.returncode != 0:
-            raise OSError((acl.stderr or acl.stdout).strip() or f"icacls exited {acl.returncode}")
-
-        def ps_quote(value: str) -> str:
-            return value.replace("'", "''")
-
         session_id = get_active_windows_session_id()
-        if not session_id:
+        if session_id is None:
             raise OSError("No active Windows user session")
+        capture_dir.mkdir(exist_ok=True)
+        for stale_ipc in (capture_dir / "request.json", capture_dir / "request.tmp", capture_dir / "result.json", capture_dir / "result.tmp"):
+            stale_ipc.unlink(missing_ok=True)
+
+        def ps_quote(value: object) -> str:
+            return str(value).replace("'", "''")
+
         script = (
-            f"$proc=Get-CimInstance Win32_Process -Filter \"Name='explorer.exe'\" | Where-Object {{$_.SessionId -eq {session_id}}} | Select-Object -First 1;"
+            f"$proc=Get-CimInstance Win32_Process -Filter \"Name='explorer.exe'\" | Where-Object {{$_.SessionId -eq {int(session_id)}}} | Select-Object -First 1;"
             "if(-not $proc){throw 'Active session has no Explorer process'};"
             "$owner=Invoke-CimMethod -InputObject $proc -MethodName GetOwner;"
-            "$user=if($owner.Domain){$owner.Domain+'\\'+$owner.User}else{$owner.User};"
-            f"$a=New-ScheduledTaskAction -Execute 'cmd.exe' -Argument '/c \"\"{ps_quote(str(runner_path))}\"\"';"
-            "$p=New-ScheduledTaskPrincipal -UserId $user -LogonType Interactive -RunLevel Limited;"
+            "$account=if($owner.Domain){$owner.Domain+'\\'+$owner.User}else{$owner.User};"
+            "$sid=(New-Object System.Security.Principal.NTAccount($account)).Translate([System.Security.Principal.SecurityIdentifier]).Value;"
+            f"$dir='{ps_quote(capture_dir)}';"
+            "$acl=New-Object System.Security.AccessControl.DirectorySecurity;"
+            "$acl.SetAccessRuleProtection($true,$false);"
+            "foreach($entry in @(@('S-1-5-18','FullControl'),@('S-1-5-32-544','FullControl'),@($sid,'Modify'))){"
+            "$identity=New-Object System.Security.Principal.SecurityIdentifier($entry[0]);"
+            "$rule=New-Object System.Security.AccessControl.FileSystemAccessRule($identity,$entry[1],'ContainerInherit,ObjectInherit','None','Allow');"
+            "$acl.AddAccessRule($rule)|Out-Null};Set-Acl -LiteralPath $dir -AclObject $acl;"
+            f"$a=New-ScheduledTaskAction -Execute '{ps_quote(sys.executable)}' -Argument '\"{ps_quote(RUNTIME_DIR / 'agent.py')}\" --interactive-helper';"
+            "$p=New-ScheduledTaskPrincipal -UserId $sid -LogonType Interactive -RunLevel Limited;"
             "$s=New-ScheduledTaskSettingsSet -ExecutionTimeLimit (New-TimeSpan -Minutes 1) "
             "-MultipleInstances IgnoreNew -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries;"
-            "Register-ScheduledTask -TaskName 'LabKom Agent Interactive Capture' -Action $a "
-            "-Principal $p -Settings $s -Force | Out-Null"
+            f"Register-ScheduledTask -TaskName '{INTERACTIVE_TASK_NAME}' -Action $a "
+            "-Principal $p -Settings $s -Force | Out-Null;Write-Output $sid"
         )
         registered = subprocess.run(
             ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
@@ -565,26 +612,31 @@ def ensure_windows_interactive_capture_task() -> bool:
         )
         if registered.returncode != 0:
             raise OSError((registered.stderr or registered.stdout).strip() or f"PowerShell exited {registered.returncode}")
-        logger.info("Interactive capture task ready (demand-only, one-minute limit)")
+        logger.info("Interactive task ready for active session %s (demand-only, one-minute limit)", session_id)
         return True
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        logger.error("Could not prepare interactive capture task: %s", exc)
+    except (OSError, subprocess.TimeoutExpired, ValueError) as exc:
+        logger.error("Could not prepare interactive task: %s", exc)
         return False
 
 
-def run_windows_interactive_capture(kind: str) -> tuple[bool, str]:
-    if not ensure_windows_interactive_capture_task():
-        return False, "Interactive capture unavailable; confirm an active unlocked Windows user session"
+def run_windows_interactive_command(kind: str, payload: Optional[dict] = None) -> tuple[bool, str]:
+    if kind not in INTERACTIVE_COMMANDS:
+        return False, "Invalid interactive command"
+    expected_session_id = get_active_windows_session_id()
+    if expected_session_id is None or not ensure_windows_interactive_capture_task():
+        return False, "Interactive command unavailable; confirm an active unlocked Windows user session"
     capture_dir = INSTALL_DIR / "interactive-capture"
-    request_path = INSTALL_DIR / "interactive-capture-request.json"
+    request_path = capture_dir / "request.json"
     result_path = capture_dir / "result.json"
     nonce = secrets.token_hex(16)
+    request = {"kind": kind, "nonce": nonce, "payload": payload or {}}
     try:
-        capture_dir.mkdir(exist_ok=True)
         result_path.unlink(missing_ok=True)
-        request_path.write_text(json.dumps({"kind": kind, "nonce": nonce}), encoding="utf-8")
+        request_tmp = request_path.with_suffix(".tmp")
+        request_tmp.write_text(json.dumps(request), encoding="utf-8")
+        os.replace(request_tmp, request_path)
         started = subprocess.run(
-            ["schtasks", "/run", "/tn", "LabKom Agent Interactive Capture"],
+            ["schtasks", "/run", "/tn", INTERACTIVE_TASK_NAME],
             capture_output=True,
             text=True,
             timeout=10,
@@ -592,36 +644,47 @@ def run_windows_interactive_capture(kind: str) -> tuple[bool, str]:
         )
         if started.returncode != 0:
             detail = (started.stderr or started.stdout).strip()
-            return False, f"Interactive capture task could not start: {detail or started.returncode}"
+            return False, f"Interactive task could not start: {detail or started.returncode}"
 
         deadline = time.monotonic() + 45
         while time.monotonic() < deadline:
             if result_path.exists():
                 if result_path.stat().st_size > 8 * 1024 * 1024:
-                    return False, "Interactive capture result exceeds size limit"
+                    return False, "Interactive result exceeds size limit"
                 result = json.loads(result_path.read_text(encoding="utf-8"))
-                if result.get("nonce") != nonce:
-                    return False, "Interactive capture returned an invalid nonce"
-                return bool(result.get("success")), str(result.get("result") or "")
+                if result.get("nonce") == nonce:
+                    if result.get("sessionId") != expected_session_id:
+                        return False, "Interactive helper ran in the wrong Windows session"
+                    return bool(result.get("success")), str(result.get("result") or "")
+                result_path.unlink(missing_ok=True)
             time.sleep(0.25)
         subprocess.run(
-            ["schtasks", "/end", "/tn", "LabKom Agent Interactive Capture"],
+            ["schtasks", "/end", "/tn", INTERACTIVE_TASK_NAME],
             capture_output=True,
             timeout=10,
             check=False,
         )
-        return False, "Interactive capture timed out; confirm an active unlocked Windows user session"
+        return False, "Interactive command timed out; confirm an active unlocked Windows user session"
     except (OSError, ValueError, json.JSONDecodeError) as exc:
-        return False, f"Interactive capture failed: {exc}"
+        return False, f"Interactive command failed: {exc}"
     finally:
         request_path.unlink(missing_ok=True)
+        request_path.with_suffix(".tmp").unlink(missing_ok=True)
         result_path.unlink(missing_ok=True)
+
+
+def run_windows_interactive_capture(kind: str) -> tuple[bool, str]:
+    return run_windows_interactive_command(kind)
 
 
 def capture_screen_diagnostic(payload: dict) -> tuple[bool, str]:
     if is_windows_session_zero():
         return run_windows_interactive_capture("CAPTURE_SCREEN")
-    notify_lab_inspection("CAPTURE_SCREEN", payload)
+    if platform.system() == "Windows" and not INTERACTIVE_MODE:
+        return False, "Interactive screen capture requires the SYSTEM agent task and an active unlocked user session"
+    notified, detail = notify_lab_inspection("CAPTURE_SCREEN")
+    if not notified:
+        return False, detail
     try:
         from PIL import Image, ImageGrab
     except ImportError as exc:
@@ -659,7 +722,11 @@ def capture_screen_diagnostic(payload: dict) -> tuple[bool, str]:
 def capture_webcam_diagnostic(payload: dict) -> tuple[bool, str]:
     if is_windows_session_zero():
         return run_windows_interactive_capture("CAPTURE_WEBCAM")
-    notify_lab_inspection("CAPTURE_WEBCAM", payload)
+    if platform.system() == "Windows" and not INTERACTIVE_MODE:
+        return False, "Interactive webcam capture requires the SYSTEM agent task and an active unlocked user session"
+    notified, detail = notify_lab_inspection("CAPTURE_WEBCAM")
+    if not notified:
+        return False, detail
     try:
         import cv2
     except ImportError as exc:
@@ -729,37 +796,57 @@ def lock_windows_workstation() -> str:
     return "LockWorkStation command sent; if agent runs as SYSTEM, Windows Session 0 isolation may prevent visible lock"
 
 
-def get_active_windows_session_id() -> Optional[str]:
-    for command in (["query", "user"], ["query", "session"]):
+def get_active_windows_session_id() -> Optional[int]:
+    if platform.system() != "Windows":
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class WtsSessionInfo(ctypes.Structure):
+            _fields_ = [
+                ("session_id", wintypes.DWORD),
+                ("station_name", wintypes.LPWSTR),
+                ("state", wintypes.DWORD),
+            ]
+
+        sessions = ctypes.POINTER(WtsSessionInfo)()
+        count = wintypes.DWORD()
+        wtsapi = ctypes.windll.wtsapi32
+        if not wtsapi.WTSEnumerateSessionsW(None, 0, 1, ctypes.byref(sessions), ctypes.byref(count)):
+            return None
         try:
-            result = subprocess.run(command, capture_output=True, text=True, check=False)
-        except OSError:
-            continue
-
-        if result.returncode != 0:
-            continue
-
-        for line in result.stdout.splitlines():
-            if "Active" not in line:
-                continue
-            match = re.search(r"\s+(\d+)\s+Active\b", line)
-            if match:
-                return match.group(1)
-
-    return None
+            active_ids = [int(sessions[index].session_id) for index in range(count.value) if sessions[index].state == 0]
+        finally:
+            wtsapi.WTSFreeMemory(sessions)
+        console_id = int(ctypes.windll.kernel32.WTSGetActiveConsoleSessionId())
+        if console_id in active_ids:
+            return console_id
+        return active_ids[0] if len(active_ids) == 1 else None
+    except Exception:
+        return None
 
 
-def report_result(config: dict, command_id: str, success: bool, result: str):
+def report_result(config: dict, command_id: str, success: bool, result: str) -> bool:
     url = f"{config['base_url']}/agent/commands/{command_id}/result"
     payload = {
         "pcCode": config["pc_code"],
         "success": success,
         "result": result,
     }
-    try:
-        requests.post(url, json=payload, headers=get_headers(config["agent_token"]), timeout=10)
-    except requests.RequestException as e:
-        logger.error("Failed to report result for %s: %s", command_id, e)
+    for attempt in range(3):
+        try:
+            response = requests.post(url, json=payload, headers=get_headers(config["agent_token"]), timeout=10)
+            if 200 <= response.status_code < 300:
+                return True
+            logger.error("Failed to report result for %s: HTTP %s", command_id, response.status_code)
+            if response.status_code < 500:
+                return False
+        except requests.RequestException as exc:
+            logger.error("Failed to report result for %s: %s", command_id, exc)
+        if attempt < 2:
+            time.sleep(attempt + 1)
+    return False
 
 
 def send_log(config: dict, event_type: str, level: str, message: str):
@@ -776,21 +863,32 @@ def send_log(config: dict, event_type: str, level: str, message: str):
 
 def interactive_capture_main() -> int:
     capture_dir = INSTALL_DIR / "interactive-capture"
-    request_path = INSTALL_DIR / "interactive-capture-request.json"
+    request_path = capture_dir / "request.json"
     result_path = capture_dir / "result.json"
     try:
         request = json.loads(request_path.read_text(encoding="utf-8"))
         kind = request.get("kind")
         nonce = str(request.get("nonce") or "")
-        if kind not in {"CAPTURE_SCREEN", "CAPTURE_WEBCAM"} or not re.fullmatch(r"[0-9a-f]{32}", nonce):
-            raise ValueError("Invalid interactive capture request")
+        payload = request.get("payload") or {}
+        session_id = get_current_windows_session_id()
+        if session_id is None or session_id == 0:
+            raise ValueError("Interactive helper is not running in a user session")
+        if kind not in INTERACTIVE_COMMANDS or not re.fullmatch(r"[0-9a-f]{32}", nonce) or not isinstance(payload, dict):
+            raise ValueError("Invalid interactive request")
         if kind == "CAPTURE_SCREEN":
-            success, result = capture_screen_diagnostic({"silent": True})
+            success, result = capture_screen_diagnostic({})
+        elif kind == "CAPTURE_WEBCAM":
+            success, result = capture_webcam_diagnostic({})
         else:
-            success, result = capture_webcam_diagnostic({"silent": True})
-        output = {"nonce": nonce, "success": success, "result": result}
+            success, result = open_target_url({"url": validate_http_url(payload.get("url"))})
+        output = {"nonce": nonce, "sessionId": session_id, "success": success, "result": result}
     except Exception as exc:
-        output = {"nonce": locals().get("nonce", ""), "success": False, "result": f"Interactive helper failed: {exc}"}
+        output = {
+            "nonce": locals().get("nonce", ""),
+            "sessionId": locals().get("session_id"),
+            "success": False,
+            "result": f"Interactive helper failed: {exc}",
+        }
 
     temp_path = result_path.with_suffix(".tmp")
     try:
@@ -840,7 +938,8 @@ def run_agent(config: dict, stop_event: threading.Event) -> None:
                 if not success:
                     logger.error("Command %s (%s) failed: %s", cmd.get("command"), cmd.get("id"), result)
                 try:
-                    report_result(config, cmd["id"], success, result)
+                    if not report_result(config, cmd["id"], success, result):
+                        logger.error("Command result delivery exhausted retries for %s", cmd["id"])
                     send_log(
                         config,
                         "COMMAND_EXECUTED" if success else "COMMAND_FAILED",
@@ -869,6 +968,6 @@ def main():
 
 
 if __name__ == "__main__":
-    if "--interactive-capture" in sys.argv:
+    if INTERACTIVE_MODE:
         raise SystemExit(interactive_capture_main())
     main()

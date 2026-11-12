@@ -61,6 +61,7 @@ class WindowsBootstrapTests(unittest.TestCase):
         self.assertIn('$taskStatus.State -ne "Running"', installer)
         self.assertIn('$agentTask.Settings.RestartCount = 3', installer)
         self.assertIn('$agentTask.Settings.RestartInterval = "PT1M"', installer)
+        self.assertIn("Interactive task is registered/refreshed on demand by the running SYSTEM agent", installer)
         self.assertIn("Provisioning Token", installer)
         self.assertIn("C:\\ProgramData\\LabKom Agent", installer)
         self.assertLess(installer.index('Write-Ok "Dependencies installed"'), installer.index('Write-Step "Stopping existing LabKom Agent if present"'))

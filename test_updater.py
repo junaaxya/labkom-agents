@@ -363,6 +363,14 @@ class UpdaterTests(unittest.TestCase):
 
 
 class AgentLoopTests(unittest.TestCase):
+    def test_result_delivery_retries_server_failure(self):
+        config = {"base_url": "https://lab-ilkom.my.id/api/v1/pcs", "pc_code": "PC-LABM-10", "agent_token": "test"}
+        responses = [mock.Mock(status_code=503), mock.Mock(status_code=200)]
+        with mock.patch("agent.requests.post", side_effect=responses) as post, mock.patch("agent.time.sleep") as sleep:
+            self.assertTrue(agent.report_result(config, "command-1", True, "done"))
+        self.assertEqual(post.call_count, 2)
+        sleep.assert_called_once_with(1)
+
     def test_command_exception_is_reported_without_stopping_agent(self):
         config = {"heartbeat_interval": 1, "command_poll_interval": 5}
         stop_event = threading.Event()
@@ -435,68 +443,182 @@ class AgentLoopTests(unittest.TestCase):
         self.assertEqual(poll_count, 1)
 
 
-class WindowsInteractiveCaptureTests(unittest.TestCase):
-    def test_task_uses_active_user_without_password_or_trigger(self):
-        runs = [
-            subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr=""),
-            subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr=""),
-        ]
-        with tempfile.TemporaryDirectory() as tmp, \
-             mock.patch("agent.INSTALL_DIR", Path(tmp)), \
-             mock.patch("agent.RUNTIME_DIR", Path(tmp) / "current"), \
-             mock.patch("agent.platform.system", return_value="Windows"), \
-             mock.patch("agent.is_windows_session_zero", return_value=True), \
-             mock.patch("agent.get_active_windows_session_id", return_value="2"), \
-             mock.patch("agent.subprocess.run", side_effect=runs) as run:
-            self.assertTrue(agent.ensure_windows_interactive_capture_task())
+class WindowsInteractiveCommandTests(unittest.TestCase):
+    def test_capabilities_are_reported_by_registration_and_heartbeat(self):
+        self.assertEqual(agent.get_system_info()["agentCapabilities"], list(agent.AGENT_CAPABILITIES))
+        self.assertEqual(agent.get_metrics()["agentCapabilities"], list(agent.AGENT_CAPABILITIES))
 
-        registration = run.call_args_list[1].args[0][-1]
-        self.assertIn("-LogonType Interactive", registration)
-        self.assertIn("-ExecutionTimeLimit", registration)
-        self.assertNotIn("-Password", registration)
-        self.assertNotIn("New-ScheduledTaskTrigger", registration)
-        self.assertIn("SessionId -eq 2", registration)
-
-    def test_session_zero_capture_runs_bounded_interactive_task(self):
-        result = {
-            "nonce": "a" * 32,
-            "success": True,
-            "result": '{"kind":"screen"}',
-        }
-        with tempfile.TemporaryDirectory() as tmp, \
-             mock.patch("agent.INSTALL_DIR", Path(tmp)), \
-             mock.patch("agent.ensure_windows_interactive_capture_task", return_value=True), \
-             mock.patch("agent.secrets.token_hex", return_value="a" * 32), \
-             mock.patch("agent.subprocess.run") as run, \
-             mock.patch("agent.time.sleep", side_effect=lambda _delay: (Path(tmp) / "interactive-capture" / "result.json").write_text(json.dumps(result))):
-            run.return_value = subprocess.CompletedProcess(args=[], returncode=0, stdout="SUCCESS", stderr="")
-            ok, payload = agent.run_windows_interactive_capture("CAPTURE_SCREEN")
-
+    def test_windows_notification_targets_helper_session_not_all_sessions(self):
+        completed = subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
+        with mock.patch("agent.platform.system", return_value="Windows"), \
+             mock.patch("agent.get_current_windows_session_id", return_value=2), \
+             mock.patch("agent.subprocess.run", return_value=completed) as run:
+            ok, _ = agent.notify_lab_inspection("OPEN_URL")
         self.assertTrue(ok)
-        self.assertEqual(payload, result["result"])
         run.assert_called_once_with(
-            ["schtasks", "/run", "/tn", "LabKom Agent Interactive Capture"],
+            ["msg.exe", "2", "/TIME:15", "Koordinator Lab sedang melakukan tindakan transparan (OPEN_URL)"],
             capture_output=True,
             text=True,
             timeout=10,
             check=False,
         )
 
-    def test_interactive_helper_rejects_unknown_request(self):
-        with tempfile.TemporaryDirectory() as tmp, mock.patch("agent.INSTALL_DIR", Path(tmp)):
+    def test_task_uses_exact_active_user_without_shell_runner_password_or_trigger(self):
+        completed = subprocess.CompletedProcess(args=[], returncode=0, stdout="S-1-5-21-test", stderr="")
+        with tempfile.TemporaryDirectory() as tmp, \
+             mock.patch("agent.INSTALL_DIR", Path(tmp)), \
+             mock.patch("agent.RUNTIME_DIR", Path(tmp) / "current"), \
+             mock.patch("agent.platform.system", return_value="Windows"), \
+             mock.patch("agent.is_windows_session_zero", return_value=True), \
+             mock.patch("agent.get_active_windows_session_id", return_value=2), \
+             mock.patch("agent.subprocess.run", return_value=completed) as run:
+            self.assertTrue(agent.ensure_windows_interactive_capture_task())
+
+        registration = run.call_args.args[0][-1]
+        self.assertIn("SessionId -eq 2", registration)
+        self.assertIn("-LogonType Interactive", registration)
+        self.assertIn("-ExecutionTimeLimit", registration)
+        self.assertIn("--interactive-helper", registration)
+        self.assertIn("SetAccessRuleProtection($true,$false)", registration)
+        self.assertIn("Set-Acl -LiteralPath $dir", registration)
+        self.assertNotIn("S-1-5-4", registration)
+        self.assertNotIn("cmd.exe", registration)
+        self.assertNotIn("-Password", registration)
+        self.assertNotIn("New-ScheduledTaskTrigger", registration)
+
+    def test_no_active_user_rejects_interactive_command(self):
+        with mock.patch("agent.platform.system", return_value="Windows"), \
+             mock.patch("agent.is_windows_session_zero", return_value=True), \
+             mock.patch("agent.get_active_windows_session_id", return_value=None), \
+             mock.patch("agent.subprocess.run") as run:
+            ok, result = agent.run_windows_interactive_command("OPEN_URL", {"url": "https://lab-ilkom.my.id"})
+        self.assertFalse(ok)
+        self.assertIn("active unlocked Windows user session", result)
+        run.assert_not_called()
+
+    def test_interactive_open_url_success_uses_data_only_ipc(self):
+        result = {"nonce": "a" * 32, "sessionId": 2, "success": True, "result": "Opened URL visibly in active user session: https://lab-ilkom.my.id"}
+        with tempfile.TemporaryDirectory() as tmp, \
+             mock.patch("agent.INSTALL_DIR", Path(tmp)), \
+             mock.patch("agent.get_active_windows_session_id", return_value=2), \
+             mock.patch("agent.ensure_windows_interactive_capture_task", return_value=True), \
+             mock.patch("agent.secrets.token_hex", return_value="a" * 32), \
+             mock.patch("agent.subprocess.run") as run, \
+             mock.patch("agent.time.sleep", side_effect=lambda _delay: (Path(tmp) / "interactive-capture" / "result.json").write_text(json.dumps(result))):
+            (Path(tmp) / "interactive-capture").mkdir()
+            run.return_value = subprocess.CompletedProcess(args=[], returncode=0, stdout="SUCCESS", stderr="")
+            ok, payload = agent.run_windows_interactive_command("OPEN_URL", {"url": "https://lab-ilkom.my.id"})
+            request = json.loads((Path(tmp) / "interactive-capture" / "request.tmp").read_text()) if (Path(tmp) / "interactive-capture" / "request.tmp").exists() else None
+
+        self.assertTrue(ok)
+        self.assertEqual(payload, result["result"])
+        self.assertIsNone(request)
+        run.assert_called_once_with(
+            ["schtasks", "/run", "/tn", agent.INTERACTIVE_TASK_NAME],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+
+    def test_wrong_session_result_is_rejected(self):
+        result = {"nonce": "a" * 32, "sessionId": 3, "success": True, "result": "visible"}
+        with tempfile.TemporaryDirectory() as tmp, \
+             mock.patch("agent.INSTALL_DIR", Path(tmp)), \
+             mock.patch("agent.get_active_windows_session_id", return_value=2), \
+             mock.patch("agent.ensure_windows_interactive_capture_task", return_value=True), \
+             mock.patch("agent.secrets.token_hex", return_value="a" * 32), \
+             mock.patch("agent.subprocess.run", return_value=subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")), \
+             mock.patch("agent.time.sleep", side_effect=lambda _delay: (Path(tmp) / "interactive-capture" / "result.json").write_text(json.dumps(result))):
+            (Path(tmp) / "interactive-capture").mkdir()
+            ok, detail = agent.run_windows_interactive_command("OPEN_URL", {"url": "https://lab-ilkom.my.id"})
+        self.assertFalse(ok)
+        self.assertIn("wrong Windows session", detail)
+
+    def test_task_timeout_ends_helper_and_cleans_ipc(self):
+        with tempfile.TemporaryDirectory() as tmp, \
+             mock.patch("agent.INSTALL_DIR", Path(tmp)), \
+             mock.patch("agent.get_active_windows_session_id", return_value=2), \
+             mock.patch("agent.ensure_windows_interactive_capture_task", return_value=True), \
+             mock.patch("agent.time.monotonic", side_effect=[0, 46]), \
+             mock.patch("agent.subprocess.run", return_value=subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")) as run:
+            (Path(tmp) / "interactive-capture").mkdir()
+            ok, result = agent.run_windows_interactive_capture("CAPTURE_SCREEN")
+            self.assertFalse((Path(tmp) / "interactive-capture" / "request.json").exists())
+
+        self.assertFalse(ok)
+        self.assertIn("timed out", result)
+        self.assertEqual(run.call_args_list[-1].args[0], ["schtasks", "/end", "/tn", agent.INTERACTIVE_TASK_NAME])
+
+    def test_interactive_helper_rejects_unknown_or_executable_request(self):
+        for kind, payload in (("SHELL", {}), ("OPEN_URL", {"url": r"C:\\Windows\\System32\\cmd.exe"})):
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory() as tmp, \
+                 mock.patch("agent.INSTALL_DIR", Path(tmp)), \
+                 mock.patch("agent.get_current_windows_session_id", return_value=2):
+                capture_dir = Path(tmp) / "interactive-capture"
+                capture_dir.mkdir()
+                (capture_dir / "request.json").write_text(json.dumps({"kind": kind, "nonce": "a" * 32, "payload": payload}))
+                self.assertEqual(agent.interactive_capture_main(), 1)
+                result = json.loads((capture_dir / "result.json").read_text())
+                self.assertFalse(result["success"])
+
+    def test_helper_open_url_notifies_and_uses_startfile_without_shell(self):
+        with tempfile.TemporaryDirectory() as tmp, \
+             mock.patch("agent.INSTALL_DIR", Path(tmp)), \
+             mock.patch("agent.platform.system", return_value="Windows"), \
+             mock.patch("agent.INTERACTIVE_MODE", True), \
+             mock.patch("agent.is_windows_session_zero", return_value=False), \
+             mock.patch("agent.get_current_windows_session_id", return_value=2), \
+             mock.patch("agent.notify_lab_inspection", return_value=(True, "visible")) as notify, \
+             mock.patch("agent.os.startfile", create=True) as startfile, \
+             mock.patch("agent.subprocess.Popen") as popen:
             capture_dir = Path(tmp) / "interactive-capture"
             capture_dir.mkdir()
-            (Path(tmp) / "interactive-capture-request.json").write_text(json.dumps({"kind": "SHELL", "nonce": "a" * 32}))
-            self.assertEqual(agent.interactive_capture_main(), 1)
+            (capture_dir / "request.json").write_text(json.dumps({"kind": "OPEN_URL", "nonce": "a" * 32, "payload": {"url": "https://lab-ilkom.my.id/path?q=1"}}))
+            self.assertEqual(agent.interactive_capture_main(), 0)
             result = json.loads((capture_dir / "result.json").read_text())
 
-        self.assertFalse(result["success"])
-        self.assertIn("Invalid interactive capture request", result["result"])
+        self.assertTrue(result["success"])
+        notify.assert_called_once_with("OPEN_URL")
+        startfile.assert_called_once_with("https://lab-ilkom.my.id/path?q=1")
+        popen.assert_not_called()
+
+    def test_failed_visible_notification_blocks_all_interactive_actions(self):
+        for kind in agent.INTERACTIVE_COMMANDS:
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory() as tmp, \
+                 mock.patch("agent.INSTALL_DIR", Path(tmp)), \
+                 mock.patch("agent.platform.system", return_value="Windows"), \
+                 mock.patch("agent.INTERACTIVE_MODE", True), \
+                 mock.patch("agent.is_windows_session_zero", return_value=False), \
+                 mock.patch("agent.get_current_windows_session_id", return_value=2), \
+                 mock.patch("agent.notify_lab_inspection", return_value=(False, "notification failed")), \
+                 mock.patch("agent.os.startfile", create=True) as startfile:
+                capture_dir = Path(tmp) / "interactive-capture"
+                capture_dir.mkdir()
+                payload = {"url": "https://lab-ilkom.my.id"} if kind == "OPEN_URL" else {}
+                (capture_dir / "request.json").write_text(json.dumps({"kind": kind, "nonce": "a" * 32, "payload": payload}))
+                self.assertEqual(agent.interactive_capture_main(), 1)
+                result = json.loads((capture_dir / "result.json").read_text())
+                self.assertFalse(result["success"])
+                self.assertIn("notification failed", result["result"])
+                startfile.assert_not_called()
 
 
 class AgentMaintenanceCommandTests(unittest.TestCase):
-    def test_version_is_1_2_4(self):
+    def test_version_is_1_2_4_without_release_bump(self):
         self.assertEqual(agent.AGENT_VERSION, "1.2.4")
+
+    def test_v1_0_0_has_no_interactive_capability_contract(self):
+        legacy_source = subprocess.run(
+            ["git", "show", "6dd3d7e:agent.py"],
+            cwd=Path(__file__).resolve().parent,
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout
+        self.assertNotIn("CAPTURE_SCREEN", legacy_source)
+        self.assertNotIn("CAPTURE_WEBCAM", legacy_source)
+        self.assertNotIn("agentCapabilities", legacy_source)
 
     def test_list_processes(self):
         fake_proc = mock.MagicMock()
@@ -548,16 +670,44 @@ class AgentMaintenanceCommandTests(unittest.TestCase):
             fake_proc.kill.assert_called_once()
             self.assertIn("9999", msg)
 
-    def test_open_url_validates_scheme_and_opens(self):
-        ok, msg = agent.execute_command({"command": "OPEN_URL", "payload": {"url": "javascript:alert(1)"}})
-        self.assertFalse(ok)
-        self.assertIn("http://", msg)
+    def test_open_url_rejects_malformed_schemes_credentials_paths_and_injection(self):
+        invalid_urls = (
+            "javascript:alert(1)",
+            "file:///C:/Windows/System32/cmd.exe",
+            r"C:\Windows\System32\cmd.exe",
+            "https://user:password@example.com/",
+            "https://example.com/a b",
+            "https://example.com/\r\ncalc.exe",
+            "https://example.com:invalid/",
+        )
+        with mock.patch("agent.run_windows_interactive_command") as interactive:
+            for url in invalid_urls:
+                with self.subTest(url=url):
+                    ok, msg = agent.execute_command({"command": "OPEN_URL", "payload": {"url": url}})
+                    self.assertFalse(ok)
+                    self.assertIn("Invalid URL", msg)
+            interactive.assert_not_called()
 
+    def test_session_zero_open_url_routes_to_bounded_interactive_helper(self):
         with mock.patch("agent.platform.system", return_value="Windows"), \
-             mock.patch("agent.subprocess.Popen") as mock_popen:
+             mock.patch("agent.is_windows_session_zero", return_value=True), \
+             mock.patch("agent.run_windows_interactive_command", return_value=(True, "visible")) as interactive, \
+             mock.patch("agent.subprocess.Popen") as popen:
             ok, msg = agent.execute_command({"command": "OPEN_URL", "payload": {"url": "https://lab-ilkom.my.id"}})
-            self.assertTrue(ok)
-            mock_popen.assert_called_once_with(["cmd", "/c", "start", "", "https://lab-ilkom.my.id"])
+        self.assertTrue(ok)
+        self.assertEqual(msg, "visible")
+        interactive.assert_called_once_with("OPEN_URL", {"url": "https://lab-ilkom.my.id"})
+        popen.assert_not_called()
+
+    def test_noninteractive_windows_process_cannot_claim_open_url_success(self):
+        with mock.patch("agent.platform.system", return_value="Windows"), \
+             mock.patch("agent.is_windows_session_zero", return_value=False), \
+             mock.patch("agent.INTERACTIVE_MODE", False), \
+             mock.patch("agent.os.startfile", create=True) as startfile:
+            ok, msg = agent.open_target_url({"url": "https://lab-ilkom.my.id"})
+        self.assertFalse(ok)
+        self.assertIn("SYSTEM agent task", msg)
+        startfile.assert_not_called()
 
     def test_clean_temp_deletes_files_and_skips_locked(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -598,11 +748,11 @@ class AgentMaintenanceCommandTests(unittest.TestCase):
         fake_pil_pkg = mock.MagicMock(Image=fake_pil_image, ImageGrab=fake_pil_image_grab)
 
         with mock.patch.dict(sys.modules, {"PIL": fake_pil_pkg, "PIL.Image": fake_pil_image, "PIL.ImageGrab": fake_pil_image_grab}), \
-             mock.patch("agent.shutil.which", return_value="/usr/bin/notify-send"), \
+             mock.patch("agent.notify_lab_inspection", return_value=(True, "visible")), \
              mock.patch("agent.subprocess.Popen") as mock_popen:
             ok, result = agent.execute_command({"command": "CAPTURE_SCREEN", "payload": {}})
             self.assertTrue(ok)
-            mock_popen.assert_called_once()
+            mock_popen.assert_not_called()
             parsed = json.loads(result)
             self.assertEqual(parsed["kind"], "screen")
             self.assertEqual(parsed["mimeType"], "image/jpeg")
@@ -631,11 +781,11 @@ class AgentMaintenanceCommandTests(unittest.TestCase):
         fake_cv2.imencode.return_value = (True, fake_encoded)
 
         with mock.patch.dict(sys.modules, {"cv2": fake_cv2}), \
-             mock.patch("agent.shutil.which", return_value="/usr/bin/notify-send"), \
+             mock.patch("agent.notify_lab_inspection", return_value=(True, "visible")), \
              mock.patch("agent.subprocess.Popen") as mock_popen:
             ok, result = agent.execute_command({"command": "CAPTURE_WEBCAM", "payload": {"silent": True}})
             self.assertTrue(ok)
-            mock_popen.assert_called_once()
+            mock_popen.assert_not_called()
             self.assertEqual(fake_cap.read.call_count, 3)
             fake_cap.release.assert_called_once()
             fake_cv2.resize.assert_called_once_with(fake_frame, (640, 360))

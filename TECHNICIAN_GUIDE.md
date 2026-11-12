@@ -91,21 +91,45 @@ Status harus berubah menjadi `Online` dalam ±1 menit.
 
 ### Windows
 
+Jalankan blok read-only ini pada tiap PC. Blok tidak membaca atau menampilkan `config.json`/token:
+
 ```powershell
-Get-Content C:\labkom-agent\agent-task.log -Tail 100
-Get-Content C:\labkom-agent\logs\agent.log -Tail 100
-Get-ScheduledTaskInfo -TaskName "LabKom Agent" | Format-List LastRunTime,LastTaskResult,NextRunTime,NumberOfMissedRuns
-Get-ScheduledTaskInfo -TaskName "LabKom Agent Interactive Capture" | Format-List LastRunTime,LastTaskResult,NextRunTime,NumberOfMissedRuns
-Get-WinEvent -FilterHashtable @{LogName='Microsoft-Windows-TaskScheduler/Operational'; StartTime=(Get-Date).AddHours(-2)} |
+$root = 'C:\labkom-agent'
+'=== INSTALLED RUNTIME ==='
+Get-Content -LiteralPath "$root\current\VERSION" -ErrorAction SilentlyContinue
+Get-Item -LiteralPath "$root\current\agent.py", "$root\current\.venv\Scripts\python.exe", "$root\updater.py" -ErrorAction SilentlyContinue |
+  Select-Object FullName,Length,LastWriteTime
+Get-CimInstance Win32_Process -Filter "Name='python.exe'" |
+  Where-Object { $_.CommandLine -like '*labkom-agent*' } |
+  Select-Object ProcessId,SessionId,ExecutablePath,CommandLine
+
+'=== TASKS ==='
+foreach ($name in 'LabKom Agent','LabKom Agent Updater','LabKom Agent Interactive Capture') {
+  $task = Get-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue
+  if (-not $task) { [pscustomobject]@{ TaskName=$name; State='MISSING' }; continue }
+  $info = Get-ScheduledTaskInfo -TaskName $name
+  [pscustomobject]@{
+    TaskName=$name; State=$task.State; UserId=$task.Principal.UserId; LogonType=$task.Principal.LogonType
+    Execute=($task.Actions.Execute -join '; '); Arguments=($task.Actions.Arguments -join '; ')
+    LastRunTime=$info.LastRunTime; LastTaskResult=('0x{0:X}' -f $info.LastTaskResult)
+  }
+}
+
+'=== ACTIVE DESKTOP ==='
+Get-CimInstance Win32_Process -Filter "Name='explorer.exe'" |
+  ForEach-Object { $owner=Invoke-CimMethod -InputObject $_ -MethodName GetOwner; [pscustomobject]@{SessionId=$_.SessionId; User="$($owner.Domain)\$($owner.User)"} }
+
+'=== RELEVANT LOGS/ARTIFACTS ==='
+Get-Content -LiteralPath "$root\agent-task.log", "$root\logs\agent.log", "$root\interactive-capture\agent.log" -Tail 100 -ErrorAction SilentlyContinue |
+  Select-String 'starting|Interactive|Executing (OPEN_URL|CAPTURE_)|Command (OPEN_URL|CAPTURE_)|notification|timed out|failed|Traceback'
+Get-ChildItem -LiteralPath "$root\interactive-capture" -Force -ErrorAction SilentlyContinue |
+  Select-Object Name,Length,LastWriteTime
+Get-WinEvent -FilterHashtable @{LogName='Microsoft-Windows-TaskScheduler/Operational'; StartTime=(Get-Date).AddHours(-2)} -ErrorAction SilentlyContinue |
   Where-Object { $_.Message -match 'LabKom Agent' } |
   Select-Object TimeCreated,Id,LevelDisplayName,Message | Format-List
 ```
 
-Hasil command lengkap (tanpa token) ada di log agent:
-
-```powershell
-Select-String -Path C:\labkom-agent\logs\agent.log -Pattern 'Executing CAPTURE_|Command CAPTURE_|Unexpected command error' -Context 0,3
-```
+Dashboard menampilkan versi saat ini dari field `agentVersion` pada heartbeat/detail PC. Event `AGENT_REGISTERED Agent v...` adalah log historis saat registrasi dan tidak membuktikan versi runtime saat ini.
 
 Kode penting:
 
@@ -114,7 +138,16 @@ Kode penting:
 - `0x41301`: task sedang running (normal untuk task agent utama).
 - `0x41303`: task belum pernah dijalankan.
 
-Task `LabKom Agent Interactive Capture` hanya demand-start saat command capture masuk, berjalan sebagai user aktif tanpa menyimpan password, menampilkan notifikasi, lalu berhenti maksimal satu menit.
+Task `LabKom Agent Interactive Capture` hanya demand-start saat screenshot, webcam, atau buka URL masuk. Agent SYSTEM meregistrasi ulang task untuk SID dan session desktop aktif, tanpa password, tanpa trigger permanen, menampilkan notifikasi wajib, lalu berhenti maksimal satu menit. Nama lama dipertahankan agar upgrade kompatibel.
+
+Interpretasi diagnosis:
+
+- `current\VERSION` bukan `1.2.4`: runtime lama/stale; upgrade dulu sebelum menilai Live Inspector.
+- `current\VERSION` = `1.2.4`, tetapi task interaktif `MISSING`: bootstrap v1.2.4 tidak membuat task itu; agent seharusnya membuatnya saat startup/command. Cek log `Could not prepare interactive capture task`.
+- Principal task bukan user yang memiliki `explorer.exe` pada session aktif: task stale/salah user.
+- Action task tidak menunjuk `current\.venv\Scripts\python.exe` dan `current\agent.py`: runtime/path stale setelah update.
+- `LastTaskResult` gagal atau artifact request/result tertinggal: helper, ACL IPC, dependency, atau delivery result gagal.
+- `OPEN_URL` pada v1.2.4 memang belum memakai task interaktif; `EXECUTED` hanya membuktikan `cmd /c start` dipanggil dari Session 0, bukan browser terlihat.
 
 ### Linux
 
