@@ -22,6 +22,20 @@ Paket ini memigrasikan instalasi lama di `C:\labkom-agent` ke layout self-update
 
 `Install-LabKom-Agent.bat` hanya memakai `ExecutionPolicy Bypass` untuk proses PowerShell yang dijalankan. Kebijakan mesin/user tidak diubah.
 
+## Alternatif upgrade dari Git checkout
+
+ZIP release tetap direkomendasikan karena menyediakan artifact dan checksum release yang exact. Bila repo sudah tersedia di PC, buka **Command Prompt sebagai Administrator**, ganti `C:\path\ke\labkom-agents` dengan path repo yang sebenarnya, lalu jalankan:
+
+```bat
+cd /d "C:\path\ke\labkom-agents"
+git pull --ff-only origin main
+powershell -NoProfile -ExecutionPolicy Bypass -File .\install-windows.ps1 -Upgrade
+```
+
+`git pull` saja tidak meng-upgrade agent terpasang; perintah installer `-Upgrade` tetap wajib dijalankan. Installer mempertahankan `pc_code`, token, dan config lama dari `C:\ProgramData\LabKom Agent\config.json`. Jangan tampilkan atau menyalin nilai token ke terminal, chat, atau dokumentasi.
+
+Setelah installer selesai, buka Task Scheduler dan pastikan task `LabKom Agent` serta `LabKom Agent Updater` tersedia. Konfirmasi versi agent terbaru dan status ONLINE pada dashboard.
+
 ## Rollback pilot
 
 Sebelum pilot, salin folder instalasi lama ke media aman. Bila migrasi gagal:
