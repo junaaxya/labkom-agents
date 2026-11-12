@@ -501,7 +501,7 @@ class WindowsInteractiveCommandTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp, \
              mock.patch("agent.INSTALL_DIR", Path(tmp)), \
              mock.patch("agent.get_active_windows_session_id", return_value=2), \
-             mock.patch("agent.ensure_windows_interactive_capture_task", return_value=True), \
+             mock.patch("agent.ensure_windows_interactive_capture_task", return_value=True) as ensure_task, \
              mock.patch("agent.secrets.token_hex", return_value="a" * 32), \
              mock.patch("agent.subprocess.run") as run, \
              mock.patch("agent.time.sleep", side_effect=lambda _delay: (Path(tmp) / "interactive-capture" / "result.json").write_text(json.dumps(result))):
@@ -513,6 +513,7 @@ class WindowsInteractiveCommandTests(unittest.TestCase):
         self.assertTrue(ok)
         self.assertEqual(payload, result["result"])
         self.assertIsNone(request)
+        ensure_task.assert_called_once_with(2)
         run.assert_called_once_with(
             ["schtasks", "/run", "/tn", agent.INTERACTIVE_TASK_NAME],
             capture_output=True,

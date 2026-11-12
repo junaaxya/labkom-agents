@@ -568,12 +568,13 @@ def ensure_windows_agent_task_resilience() -> None:
         logger.warning("Could not set agent task restart policy: %s", exc)
 
 
-def ensure_windows_interactive_capture_task() -> bool:
+def ensure_windows_interactive_capture_task(session_id: Optional[int] = None) -> bool:
     if platform.system() != "Windows" or not is_windows_session_zero():
         return False
     capture_dir = INSTALL_DIR / "interactive-capture"
     try:
-        session_id = get_active_windows_session_id()
+        if session_id is None:
+            session_id = get_active_windows_session_id()
         if session_id is None:
             raise OSError("No active Windows user session")
         capture_dir.mkdir(exist_ok=True)
@@ -623,7 +624,7 @@ def run_windows_interactive_command(kind: str, payload: Optional[dict] = None) -
     if kind not in INTERACTIVE_COMMANDS:
         return False, "Invalid interactive command"
     expected_session_id = get_active_windows_session_id()
-    if expected_session_id is None or not ensure_windows_interactive_capture_task():
+    if expected_session_id is None or not ensure_windows_interactive_capture_task(expected_session_id):
         return False, "Interactive command unavailable; confirm an active unlocked Windows user session"
     capture_dir = INSTALL_DIR / "interactive-capture"
     request_path = capture_dir / "request.json"
