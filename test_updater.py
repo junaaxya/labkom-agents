@@ -606,8 +606,8 @@ class WindowsInteractiveCommandTests(unittest.TestCase):
 
 
 class AgentMaintenanceCommandTests(unittest.TestCase):
-    def test_version_is_1_2_5(self):
-        self.assertEqual(agent.AGENT_VERSION, "1.2.5")
+    def test_version_is_1_2_6(self):
+        self.assertEqual(agent.AGENT_VERSION, "1.2.6")
 
     def test_capability_contract_by_version(self):
         self.assertEqual(agent.capabilities_for_version("1.0.0"), ())
@@ -760,41 +760,91 @@ class AgentMaintenanceCommandTests(unittest.TestCase):
             self.assertEqual(parsed["sizeBytes"], len(b"\xff\xd8\xff\xe0fakejpeg"))
             self.assertEqual(base64.b64decode(parsed["imageBase64"]), b"\xff\xd8\xff\xe0fakejpeg")
 
-    def test_capture_webcam_reads_frames_resizes_and_releases(self):
-        fake_cap = mock.MagicMock()
-        fake_cap.isOpened.return_value = True
-        fake_frame = mock.MagicMock()
-        fake_frame.shape = (720, 1280, 3)
-        fake_cap.read.return_value = (True, fake_frame)
-
-        resized_frame = mock.MagicMock()
-        resized_frame.shape = (360, 640, 3)
-
+    def test_capture_webcam_tries_dshow_black_then_msmf_valid_and_releases(self):
+        black_cap = mock.MagicMock()
+        black_cap.isOpened.return_value = True
+        black_frame = mock.MagicMock(shape=(720, 1280, 3))
+        black_cap.read.return_value = (True, black_frame)
+        valid_cap = mock.MagicMock()
+        valid_cap.isOpened.return_value = True
+        valid_frame = mock.MagicMock(shape=(720, 1280, 3))
+        valid_cap.read.return_value = (True, valid_frame)
+        resized_frame = mock.MagicMock(shape=(360, 640, 3))
+        black_gray = mock.MagicMock()
+        black_gray.mean.return_value = 0
+        black_gray.max.return_value = 0
+        valid_gray = mock.MagicMock()
+        valid_gray.mean.return_value = 40
+        valid_gray.max.return_value = 200
         fake_encoded = mock.MagicMock()
         fake_encoded.tobytes.return_value = b"\xff\xd8\xff\xe0webcamjpeg"
-
-        fake_cv2 = mock.MagicMock()
-        fake_cv2.IMWRITE_JPEG_QUALITY = 1
-        fake_cv2.VideoCapture.return_value = fake_cap
+        fake_cv2 = mock.MagicMock(CAP_DSHOW=700, CAP_MSMF=1400, COLOR_BGR2GRAY=6, IMWRITE_JPEG_QUALITY=1)
+        fake_cv2.VideoCapture.side_effect = [black_cap, valid_cap]
+        fake_cv2.cvtColor.side_effect = lambda frame, _: black_gray if frame is black_frame else valid_gray
         fake_cv2.resize.return_value = resized_frame
         fake_cv2.imencode.return_value = (True, fake_encoded)
 
         with mock.patch.dict(sys.modules, {"cv2": fake_cv2}), \
-             mock.patch("agent.notify_lab_inspection", return_value=(True, "visible")), \
-             mock.patch("agent.subprocess.Popen") as mock_popen:
-            ok, result = agent.execute_command({"command": "CAPTURE_WEBCAM", "payload": {"silent": True}})
-            self.assertTrue(ok)
-            mock_popen.assert_not_called()
-            self.assertEqual(fake_cap.read.call_count, 3)
-            fake_cap.release.assert_called_once()
-            fake_cv2.resize.assert_called_once_with(fake_frame, (640, 360))
-            parsed = json.loads(result)
-            self.assertEqual(parsed["kind"], "webcam")
-            self.assertEqual(parsed["mimeType"], "image/jpeg")
-            self.assertEqual(parsed["width"], 640)
-            self.assertEqual(parsed["height"], 360)
-            self.assertEqual(parsed["sizeBytes"], len(b"\xff\xd8\xff\xe0webcamjpeg"))
-            self.assertEqual(base64.b64decode(parsed["imageBase64"]), b"\xff\xd8\xff\xe0webcamjpeg")
+             mock.patch("agent.platform.system", return_value="Windows"):
+            ok, result = agent._capture_webcam_frame()
+
+        self.assertTrue(ok)
+        self.assertEqual(fake_cv2.VideoCapture.call_args_list, [mock.call(0, 700), mock.call(0, 1400)])
+        self.assertEqual(black_cap.read.call_count, 12)
+        black_cap.release.assert_called_once()
+        valid_cap.release.assert_called_once()
+        fake_cv2.resize.assert_called_once_with(valid_frame, (640, 360))
+        parsed = json.loads(result)
+        self.assertEqual(parsed["width"], 640)
+        self.assertEqual(parsed["height"], 360)
+        self.assertEqual(base64.b64decode(parsed["imageBase64"]), b"\xff\xd8\xff\xe0webcamjpeg")
+
+    def test_capture_webcam_rejects_nearly_black_frames_and_releases_all(self):
+        captures = []
+        gray = mock.MagicMock()
+        gray.mean.return_value = 4.9
+        gray.max.return_value = 19
+        fake_cv2 = mock.MagicMock(CAP_DSHOW=700, CAP_MSMF=1400, COLOR_BGR2GRAY=6)
+
+        def open_capture(*_):
+            cap = mock.MagicMock()
+            cap.isOpened.return_value = True
+            cap.read.return_value = (True, mock.MagicMock(shape=(480, 640, 3)))
+            captures.append(cap)
+            return cap
+
+        fake_cv2.VideoCapture.side_effect = open_capture
+        fake_cv2.cvtColor.return_value = gray
+        with mock.patch.dict(sys.modules, {"cv2": fake_cv2}), \
+             mock.patch("agent.platform.system", return_value="Windows"):
+            ok, result = agent._capture_webcam_frame()
+
+        self.assertFalse(ok)
+        self.assertIn("no usable non-black frame", result)
+        self.assertEqual(len(captures), 8)
+        self.assertTrue(all(cap.read.call_count == 12 for cap in captures))
+        self.assertTrue(all(cap.release.call_count == 1 for cap in captures))
+        fake_cv2.imencode.assert_not_called()
+
+    def test_capture_webcam_worker_times_out_and_terminates(self):
+        parent = mock.MagicMock()
+        child = mock.MagicMock()
+        parent.poll.return_value = False
+        worker = mock.MagicMock()
+        worker.is_alive.return_value = False
+        context = mock.MagicMock()
+        context.Pipe.return_value = (parent, child)
+        context.Process.return_value = worker
+
+        with mock.patch("agent.multiprocessing.get_context", return_value=context):
+            ok, result = agent.run_webcam_capture_worker(timeout=0.01)
+
+        self.assertFalse(ok)
+        self.assertIn("timed out after 0.01 seconds", result)
+        worker.start.assert_called_once()
+        worker.terminate.assert_called_once()
+        child.close.assert_called_once()
+        parent.close.assert_called_once()
 
 
 if __name__ == "__main__":

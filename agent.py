@@ -5,6 +5,7 @@ import base64
 import io
 import json
 import logging
+import multiprocessing
 import os
 import platform
 import re
@@ -733,6 +734,97 @@ def capture_screen_diagnostic(payload: dict) -> tuple[bool, str]:
         return False, f"Failed to capture screen: {exc}"
 
 
+def _capture_webcam_frame() -> tuple[bool, str]:
+    try:
+        import cv2
+    except ImportError as exc:
+        return False, f"opencv-python-headless is not installed: {exc}"
+
+    backends = (cv2.CAP_DSHOW, cv2.CAP_MSMF) if platform.system() == "Windows" else (None,)
+    errors = []
+    for index in range(4):
+        for backend in backends:
+            cap = None
+            label = f"camera {index}" + (f" backend {backend}" if backend is not None else "")
+            try:
+                cap = cv2.VideoCapture(index, backend) if backend is not None else cv2.VideoCapture(index)
+                if not cap or not cap.isOpened():
+                    errors.append(f"{label}: unavailable")
+                    continue
+
+                for _ in range(12):
+                    ok, frame = cap.read()
+                    if not ok or frame is None:
+                        continue
+                    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                    if float(gray.mean()) < 5 and int(gray.max()) < 20:
+                        continue
+
+                    h, w = frame.shape[:2]
+                    if w > 640:
+                        new_h = max(1, int(round(h * (640 / w))))
+                        frame = cv2.resize(frame, (640, new_h))
+                        h, w = frame.shape[:2]
+
+                    ok, encoded = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 70])
+                    if not ok:
+                        errors.append(f"{label}: JPEG encoding failed")
+                        break
+                    raw_bytes = encoded.tobytes()
+                    return True, json.dumps(
+                        {
+                            "kind": "webcam",
+                            "mimeType": "image/jpeg",
+                            "capturedAt": datetime.now(timezone.utc).isoformat(),
+                            "width": int(w),
+                            "height": int(h),
+                            "sizeBytes": len(raw_bytes),
+                            "imageBase64": base64.b64encode(raw_bytes).decode("ascii"),
+                        }
+                    )
+                else:
+                    errors.append(f"{label}: no usable non-black frame after 12 reads")
+            except Exception as exc:
+                errors.append(f"{label}: {exc}")
+            finally:
+                if cap is not None:
+                    try:
+                        cap.release()
+                    except Exception:
+                        pass
+    return False, "Webcam capture failed for all cameras: " + "; ".join(errors)
+
+
+def _capture_webcam_worker(connection) -> None:
+    try:
+        connection.send(_capture_webcam_frame())
+    except Exception as exc:
+        connection.send((False, f"Webcam capture worker failed: {exc}"))
+    finally:
+        connection.close()
+
+
+def run_webcam_capture_worker(timeout: float = 15) -> tuple[bool, str]:
+    context = multiprocessing.get_context("spawn")
+    parent, child = context.Pipe(duplex=False)
+    worker = context.Process(target=_capture_webcam_worker, args=(child,))
+    worker.start()
+    child.close()
+    try:
+        if parent.poll(timeout):
+            return parent.recv()
+        worker.terminate()
+        worker.join(timeout=2)
+        return False, f"Webcam capture timed out after {timeout:g} seconds"
+    except EOFError:
+        return False, "Webcam capture worker exited without a result"
+    finally:
+        parent.close()
+        if worker.is_alive():
+            worker.terminate()
+        worker.join(timeout=2)
+
+
 def capture_webcam_diagnostic(payload: dict) -> tuple[bool, str]:
     if is_windows_session_zero():
         return run_windows_interactive_capture("CAPTURE_WEBCAM")
@@ -741,56 +833,7 @@ def capture_webcam_diagnostic(payload: dict) -> tuple[bool, str]:
     notified, detail = notify_lab_inspection("CAPTURE_WEBCAM")
     if not notified:
         return False, detail
-    try:
-        import cv2
-    except ImportError as exc:
-        return False, f"opencv-python-headless is not installed: {exc}"
-
-    cap = None
-    try:
-        cap = cv2.VideoCapture(0)
-        if not cap or not cap.isOpened():
-            return False, "Webcam device not available"
-
-        frame = None
-        for _ in range(3):
-            ok, current = cap.read()
-            if ok and current is not None:
-                frame = current
-
-        if frame is None:
-            return False, "Failed to read frame from webcam"
-
-        h, w = frame.shape[:2]
-        if w > 640:
-            new_h = max(1, int(round(h * (640 / w))))
-            frame = cv2.resize(frame, (640, new_h))
-            h, w = frame.shape[:2]
-
-        ok, encoded = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 70])
-        if not ok:
-            return False, "Failed to encode webcam frame as JPEG"
-
-        raw_bytes = encoded.tobytes()
-        return True, json.dumps(
-            {
-                "kind": "webcam",
-                "mimeType": "image/jpeg",
-                "capturedAt": datetime.now(timezone.utc).isoformat(),
-                "width": int(w),
-                "height": int(h),
-                "sizeBytes": len(raw_bytes),
-                "imageBase64": base64.b64encode(raw_bytes).decode("ascii"),
-            }
-        )
-    except Exception as exc:
-        return False, f"Failed to capture webcam: {exc}"
-    finally:
-        if cap is not None:
-            try:
-                cap.release()
-            except Exception:
-                pass
+    return run_webcam_capture_worker()
 
 
 def lock_windows_workstation() -> str:
