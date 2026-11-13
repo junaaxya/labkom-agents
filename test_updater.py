@@ -479,6 +479,8 @@ class WindowsInteractiveCommandTests(unittest.TestCase):
         self.assertIn("-LogonType Interactive", registration)
         self.assertIn("-ExecutionTimeLimit", registration)
         self.assertIn("--interactive-helper", registration)
+        self.assertIn("pythonw.exe", registration)
+        self.assertNotIn("python.exe' -Argument", registration)
         self.assertIn("SetAccessRuleProtection($true,$false)", registration)
         self.assertIn("Set-Acl -LiteralPath $dir", registration)
         self.assertNotIn("S-1-5-4", registration)
@@ -820,11 +822,34 @@ class AgentMaintenanceCommandTests(unittest.TestCase):
             ok, result = agent._capture_webcam_frame()
 
         self.assertFalse(ok)
-        self.assertIn("no usable non-black frame", result)
+        self.assertIn("opened and returned 12/12 physically black frames", result)
+        self.assertIn("privacy shutter/lens cover", result)
         self.assertEqual(len(captures), 8)
         self.assertTrue(all(cap.read.call_count == 12 for cap in captures))
         self.assertTrue(all(cap.release.call_count == 1 for cap in captures))
         fake_cv2.imencode.assert_not_called()
+
+    def test_capture_webcam_distinguishes_open_camera_with_no_frames(self):
+        captures = []
+        fake_cv2 = mock.MagicMock(CAP_DSHOW=700, CAP_MSMF=1400, COLOR_BGR2GRAY=6)
+
+        def open_capture(*_):
+            cap = mock.MagicMock()
+            cap.isOpened.return_value = True
+            cap.read.return_value = (False, None)
+            captures.append(cap)
+            return cap
+
+        fake_cv2.VideoCapture.side_effect = open_capture
+        with mock.patch.dict(sys.modules, {"cv2": fake_cv2}), \
+             mock.patch("agent.platform.system", return_value="Windows"):
+            ok, result = agent._capture_webcam_frame()
+
+        self.assertFalse(ok)
+        self.assertIn("opened but returned no frames after 12 reads", result)
+        self.assertIn("privacy access, driver, or another app", result)
+        self.assertNotIn("physically black", result)
+        self.assertTrue(all(cap.release.call_count == 1 for cap in captures))
 
     def test_capture_webcam_worker_times_out_and_terminates(self):
         parent = mock.MagicMock()

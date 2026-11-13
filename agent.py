@@ -611,7 +611,7 @@ def ensure_windows_interactive_capture_task(session_id: Optional[int] = None) ->
             "$identity=New-Object System.Security.Principal.SecurityIdentifier($entry[0]);"
             "$rule=New-Object System.Security.AccessControl.FileSystemAccessRule($identity,$entry[1],'ContainerInherit,ObjectInherit','None','Allow');"
             "$acl.AddAccessRule($rule)|Out-Null};Set-Acl -LiteralPath $dir -AclObject $acl;"
-            f"$a=New-ScheduledTaskAction -Execute '{ps_quote(sys.executable)}' -Argument '\"{ps_quote(RUNTIME_DIR / 'agent.py')}\" --interactive-helper';"
+            f"$a=New-ScheduledTaskAction -Execute '{ps_quote(Path(sys.executable).with_name('pythonw.exe'))}' -Argument '\"{ps_quote(RUNTIME_DIR / 'agent.py')}\" --interactive-helper';"
             "$p=New-ScheduledTaskPrincipal -UserId $sid -LogonType Interactive -RunLevel Limited;"
             "$s=New-ScheduledTaskSettingsSet -ExecutionTimeLimit (New-TimeSpan -Minutes 1) "
             "-MultipleInstances IgnoreNew -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries;"
@@ -752,12 +752,16 @@ def _capture_webcam_frame() -> tuple[bool, str]:
                     errors.append(f"{label}: unavailable")
                     continue
 
+                read_frames = 0
+                black_frames = 0
                 for _ in range(12):
                     ok, frame = cap.read()
                     if not ok or frame is None:
                         continue
+                    read_frames += 1
                     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
                     if float(gray.mean()) < 5 and int(gray.max()) < 20:
+                        black_frames += 1
                         continue
 
                     h, w = frame.shape[:2]
@@ -783,7 +787,13 @@ def _capture_webcam_frame() -> tuple[bool, str]:
                         }
                     )
                 else:
-                    errors.append(f"{label}: no usable non-black frame after 12 reads")
+                    if black_frames:
+                        errors.append(
+                            f"{label}: opened and returned {black_frames}/{read_frames} physically black frames "
+                            "(check privacy shutter/lens cover or a disabled camera sensor)"
+                        )
+                    else:
+                        errors.append(f"{label}: opened but returned no frames after 12 reads (check privacy access, driver, or another app)")
             except Exception as exc:
                 errors.append(f"{label}: {exc}")
             finally:
