@@ -608,8 +608,8 @@ class WindowsInteractiveCommandTests(unittest.TestCase):
 
 
 class AgentMaintenanceCommandTests(unittest.TestCase):
-    def test_version_is_1_2_6(self):
-        self.assertEqual(agent.AGENT_VERSION, "1.2.6")
+    def test_version_is_1_2_7(self):
+        self.assertEqual(agent.AGENT_VERSION, "1.2.7")
 
     def test_capability_contract_by_version(self):
         self.assertEqual(agent.capabilities_for_version("1.0.0"), ())
