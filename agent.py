@@ -749,18 +749,29 @@ def _capture_webcam_frame() -> tuple[bool, str]:
             try:
                 cap = cv2.VideoCapture(index, backend) if backend is not None else cv2.VideoCapture(index)
                 if not cap or not cap.isOpened():
-                    errors.append(f"{label}: unavailable")
+                    errors.append(f"{label}: unavailable (device may be busy in another app)")
                     continue
+
+                if platform.system() == "Windows":
+                    cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+                    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+                    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
 
                 read_frames = 0
                 black_frames = 0
+                darkest_mean = None
+                brightest_pixel = None
                 for _ in range(12):
                     ok, frame = cap.read()
                     if not ok or frame is None:
                         continue
                     read_frames += 1
                     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                    if float(gray.mean()) < 5 and int(gray.max()) < 20:
+                    mean_brightness = float(gray.mean())
+                    max_brightness = int(gray.max())
+                    darkest_mean = mean_brightness if darkest_mean is None else min(darkest_mean, mean_brightness)
+                    brightest_pixel = max_brightness if brightest_pixel is None else max(brightest_pixel, max_brightness)
+                    if mean_brightness < 5 and max_brightness < 20:
                         black_frames += 1
                         continue
 
@@ -787,9 +798,14 @@ def _capture_webcam_frame() -> tuple[bool, str]:
                         }
                     )
                 else:
+                    brightness = (
+                        f"; mean brightness {darkest_mean:.1f}, brightest pixel {brightest_pixel}"
+                        if darkest_mean is not None and brightest_pixel is not None
+                        else ""
+                    )
                     if black_frames:
                         errors.append(
-                            f"{label}: opened and returned {black_frames}/{read_frames} physically black frames "
+                            f"{label}: opened and returned {black_frames}/{read_frames} physically black frames{brightness} "
                             "(check privacy shutter/lens cover or a disabled camera sensor)"
                         )
                     else:

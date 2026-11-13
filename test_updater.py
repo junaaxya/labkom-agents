@@ -780,7 +780,16 @@ class AgentMaintenanceCommandTests(unittest.TestCase):
         valid_gray.max.return_value = 200
         fake_encoded = mock.MagicMock()
         fake_encoded.tobytes.return_value = b"\xff\xd8\xff\xe0webcamjpeg"
-        fake_cv2 = mock.MagicMock(CAP_DSHOW=700, CAP_MSMF=1400, COLOR_BGR2GRAY=6, IMWRITE_JPEG_QUALITY=1)
+        fake_cv2 = mock.MagicMock(
+            CAP_DSHOW=700,
+            CAP_MSMF=1400,
+            CAP_PROP_FOURCC=6,
+            CAP_PROP_FRAME_WIDTH=3,
+            CAP_PROP_FRAME_HEIGHT=4,
+            COLOR_BGR2GRAY=6,
+            IMWRITE_JPEG_QUALITY=1,
+        )
+        fake_cv2.VideoWriter_fourcc.return_value = 1196444237
         fake_cv2.VideoCapture.side_effect = [black_cap, valid_cap]
         fake_cv2.cvtColor.side_effect = lambda frame, _: black_gray if frame is black_frame else valid_gray
         fake_cv2.resize.return_value = resized_frame
@@ -793,6 +802,11 @@ class AgentMaintenanceCommandTests(unittest.TestCase):
         self.assertTrue(ok)
         self.assertEqual(fake_cv2.VideoCapture.call_args_list, [mock.call(0, 700), mock.call(0, 1400)])
         self.assertEqual(black_cap.read.call_count, 12)
+        for cap in (black_cap, valid_cap):
+            self.assertEqual(
+                cap.set.call_args_list,
+                [mock.call(6, 1196444237), mock.call(3, 640), mock.call(4, 480)],
+            )
         black_cap.release.assert_called_once()
         valid_cap.release.assert_called_once()
         fake_cv2.resize.assert_called_once_with(valid_frame, (640, 360))
@@ -806,7 +820,14 @@ class AgentMaintenanceCommandTests(unittest.TestCase):
         gray = mock.MagicMock()
         gray.mean.return_value = 4.9
         gray.max.return_value = 19
-        fake_cv2 = mock.MagicMock(CAP_DSHOW=700, CAP_MSMF=1400, COLOR_BGR2GRAY=6)
+        fake_cv2 = mock.MagicMock(
+            CAP_DSHOW=700,
+            CAP_MSMF=1400,
+            CAP_PROP_FOURCC=6,
+            CAP_PROP_FRAME_WIDTH=3,
+            CAP_PROP_FRAME_HEIGHT=4,
+            COLOR_BGR2GRAY=6,
+        )
 
         def open_capture(*_):
             cap = mock.MagicMock()
@@ -823,6 +844,7 @@ class AgentMaintenanceCommandTests(unittest.TestCase):
 
         self.assertFalse(ok)
         self.assertIn("opened and returned 12/12 physically black frames", result)
+        self.assertIn("mean brightness 4.9, brightest pixel 19", result)
         self.assertIn("privacy shutter/lens cover", result)
         self.assertEqual(len(captures), 8)
         self.assertTrue(all(cap.read.call_count == 12 for cap in captures))
@@ -831,7 +853,14 @@ class AgentMaintenanceCommandTests(unittest.TestCase):
 
     def test_capture_webcam_distinguishes_open_camera_with_no_frames(self):
         captures = []
-        fake_cv2 = mock.MagicMock(CAP_DSHOW=700, CAP_MSMF=1400, COLOR_BGR2GRAY=6)
+        fake_cv2 = mock.MagicMock(
+            CAP_DSHOW=700,
+            CAP_MSMF=1400,
+            CAP_PROP_FOURCC=6,
+            CAP_PROP_FRAME_WIDTH=3,
+            CAP_PROP_FRAME_HEIGHT=4,
+            COLOR_BGR2GRAY=6,
+        )
 
         def open_capture(*_):
             cap = mock.MagicMock()
@@ -850,6 +879,21 @@ class AgentMaintenanceCommandTests(unittest.TestCase):
         self.assertIn("privacy access, driver, or another app", result)
         self.assertNotIn("physically black", result)
         self.assertTrue(all(cap.release.call_count == 1 for cap in captures))
+
+    def test_capture_webcam_unavailable_mentions_possible_device_contention(self):
+        unavailable = mock.MagicMock()
+        unavailable.isOpened.return_value = False
+        fake_cv2 = mock.MagicMock(CAP_DSHOW=700, CAP_MSMF=1400)
+        fake_cv2.VideoCapture.return_value = unavailable
+
+        with mock.patch.dict(sys.modules, {"cv2": fake_cv2}), \
+             mock.patch("agent.platform.system", return_value="Windows"):
+            ok, result = agent._capture_webcam_frame()
+
+        self.assertFalse(ok)
+        self.assertIn("device may be busy in another app", result)
+        self.assertEqual(fake_cv2.VideoCapture.call_count, 8)
+        self.assertEqual(unavailable.release.call_count, 8)
 
     def test_capture_webcam_worker_times_out_and_terminates(self):
         parent = mock.MagicMock()
